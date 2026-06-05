@@ -37,7 +37,7 @@ from .config import AppConfig, ShortcutItem, load_config, save_config
 from .utils import display_name, item_kind, open_path
 
 APP_NAME = "EdgeDockTool"
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.3"
 
 EDGE_LABELS = {
     "left": "左侧",
@@ -904,7 +904,7 @@ class AppTray(QApplication):
         self.hotkey_filter = HotkeyFilter(self.toggle_window_from_hotkey)
         self.installNativeEventFilter(self.hotkey_filter)
         self.hotkey_registered = False
-        self.menu_hotkey_suspended = False
+        self.hotkey_blocked = False
 
         self.tray = QSystemTrayIcon(self.icon, self)
         self.update_tray_tooltip()
@@ -925,6 +925,10 @@ class AppTray(QApplication):
         hotkey_action.setEnabled(False)
         startup_action = QAction(f"开机自启: {'已开启' if self.config.auto_start else '未开启'}", self)
         startup_action.setEnabled(False)
+        block_hotkey_action = QAction("屏蔽快捷键", self)
+        block_hotkey_action.setCheckable(True)
+        block_hotkey_action.setChecked(self.hotkey_blocked)
+        block_hotkey_action.toggled.connect(self.set_hotkey_blocked)
         restart_action = QAction("重启", self)
         restart_action.triggered.connect(self.restart_app)
         quit_action = QAction("退出", self)
@@ -932,11 +936,10 @@ class AppTray(QApplication):
         menu.addAction(settings_action)
         menu.addAction(hotkey_action)
         menu.addAction(startup_action)
+        menu.addAction(block_hotkey_action)
         menu.addAction(restart_action)
         menu.addSeparator()
         menu.addAction(quit_action)
-        menu.aboutToShow.connect(self.suspend_hotkey_for_tray_menu)
-        menu.aboutToHide.connect(self.resume_hotkey_after_tray_menu)
         return menu
 
     def open_settings(self):
@@ -970,21 +973,16 @@ class AppTray(QApplication):
         save_config(self.config)
         QApplication.exit(42)
 
-    def suspend_hotkey_for_tray_menu(self):
-        if self.menu_hotkey_suspended:
-            return
-        self.menu_hotkey_suspended = True
-        self.unregister_hotkey()
-
-    def resume_hotkey_after_tray_menu(self):
-        if not self.menu_hotkey_suspended:
-            return
-        self.menu_hotkey_suspended = False
-        self.sync_hotkey_registration()
+    def set_hotkey_blocked(self, blocked: bool):
+        self.hotkey_blocked = blocked
+        if blocked:
+            self.unregister_hotkey()
+        else:
+            self.sync_hotkey_registration()
 
     def sync_hotkey_registration(self):
         self.unregister_hotkey()
-        if self.config.launch_mode == "hotkey":
+        if self.config.launch_mode == "hotkey" and not self.hotkey_blocked:
             self.register_hotkey()
 
     def register_hotkey(self):
