@@ -31,6 +31,7 @@ class AppConfig:
     hide_delay_ms: int = 240
     pinned_position: bool = False
     launch_mode: str = "hover"
+    auto_start: bool = False
     hotkey_modifiers: list[str] = field(default_factory=lambda: ["Ctrl", "Alt"])
     hotkey_key: str = "Space"
     shortcuts: list[ShortcutItem] = field(default_factory=list)
@@ -44,6 +45,7 @@ class AppConfig:
         hide_delay_ms = int(data.get("hide_delay_ms", 240))
         pinned_position = bool(data.get("pinned_position", False))
         launch_mode = str(data.get("launch_mode", "hover"))
+        auto_start = bool(data.get("auto_start", False))
         hotkey_modifiers = list(data.get("hotkey_modifiers", ["Ctrl", "Alt"]))
         hotkey_key = str(data.get("hotkey_key", "Space"))
         if edge not in {"left", "right", "top", "bottom"}:
@@ -64,6 +66,7 @@ class AppConfig:
             hide_delay_ms=hide_delay_ms,
             pinned_position=pinned_position,
             launch_mode=launch_mode,
+            auto_start=auto_start,
             hotkey_modifiers=hotkey_modifiers,
             hotkey_key=hotkey_key,
             shortcuts=shortcuts,
@@ -77,6 +80,7 @@ class AppConfig:
             "hide_delay_ms": self.hide_delay_ms,
             "pinned_position": self.pinned_position,
             "launch_mode": self.launch_mode,
+            "auto_start": self.auto_start,
             "hotkey_modifiers": self.hotkey_modifiers,
             "hotkey_key": self.hotkey_key,
             "shortcuts": [asdict(item) for item in self.shortcuts],

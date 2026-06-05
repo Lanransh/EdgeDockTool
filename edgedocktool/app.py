@@ -4,6 +4,7 @@ import sys
 from ctypes import POINTER, Structure, WinDLL, byref, c_void_p, wintypes
 from pathlib import Path
 from subprocess import Popen
+import winreg
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QPoint, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QCursor, QDragEnterEvent, QDropEvent, QGuiApplication, QIcon, QKeyEvent, QPainter, QPixmap
@@ -34,6 +35,9 @@ from PySide6.QtWidgets import (
 
 from .config import AppConfig, ShortcutItem, load_config, save_config
 from .utils import display_name, item_kind, open_path
+
+APP_NAME = "EdgeDockTool"
+APP_VERSION = "0.1.1"
 
 EDGE_LABELS = {
     "left": "左侧",
@@ -343,6 +347,7 @@ class SettingsDialog(QDialog):
             hide_delay_ms=config.hide_delay_ms,
             pinned_position=config.pinned_position,
             launch_mode=config.launch_mode,
+            auto_start=config.auto_start,
             hotkey_modifiers=list(config.hotkey_modifiers),
             hotkey_key=config.hotkey_key,
             shortcuts=list(config.shortcuts),
@@ -419,6 +424,10 @@ class SettingsDialog(QDialog):
         self.pinned_checkbox.setChecked(self.config.pinned_position)
         self.pinned_checkbox.stateChanged.connect(self.on_changed)
 
+        self.auto_start_checkbox = QCheckBox("开机自启", self)
+        self.auto_start_checkbox.setChecked(self.config.auto_start)
+        self.auto_start_checkbox.stateChanged.connect(self.on_changed)
+
         self.list = SettingsList(self)
         for item in self.config.shortcuts:
             self.list.insert_shortcut(item)
@@ -447,6 +456,7 @@ class SettingsDialog(QDialog):
         delay_row.addWidget(QLabel("离开隐藏秒数", self))
         delay_row.addWidget(self.hide_delay_input)
         delay_row.addWidget(self.pinned_checkbox)
+        delay_row.addWidget(self.auto_start_checkbox)
         delay_row.addStretch(1)
 
         hotkey_row = QHBoxLayout()
@@ -502,6 +512,7 @@ class SettingsDialog(QDialog):
             hide_seconds = 0.24
         self.config.hide_delay_ms = max(0, min(5000, int(hide_seconds * 1000)))
         self.config.pinned_position = self.pinned_checkbox.isChecked()
+        self.config.auto_start = self.auto_start_checkbox.isChecked()
         self.config.shortcuts = self.list.shortcuts()
 
     def on_hotkey_changed(self, modifiers: list[str], key: str):
@@ -883,6 +894,8 @@ class EdgeDockWindow(QWidget):
 class AppTray(QApplication):
     def __init__(self, argv: list[str]):
         super().__init__(argv)
+        self.setApplicationName(APP_NAME)
+        self.setApplicationVersion(APP_VERSION)
         self.setQuitOnLastWindowClosed(False)
         self.icon = create_app_icon()
         self.config = load_config()
@@ -891,6 +904,7 @@ class AppTray(QApplication):
         self.hotkey_filter = HotkeyFilter(self.toggle_window_from_hotkey)
         self.installNativeEventFilter(self.hotkey_filter)
         self.hotkey_registered = False
+        self.menu_hotkey_suspended = False
 
         self.tray = QSystemTrayIcon(self.icon, self)
         self.update_tray_tooltip()
@@ -898,6 +912,7 @@ class AppTray(QApplication):
         self.tray.activated.connect(self.on_tray_activated)
         self.tray.show()
 
+        self.apply_auto_start_setting()
         self.sync_hotkey_registration()
         if not self.config.shortcuts:
             QTimer.singleShot(250, self.open_settings)
@@ -906,14 +921,22 @@ class AppTray(QApplication):
         menu = QMenu()
         settings_action = QAction("设置", self)
         settings_action.triggered.connect(self.open_settings)
+        hotkey_action = QAction(f"快捷键: {format_hotkey(self.config.hotkey_modifiers, self.config.hotkey_key)}", self)
+        hotkey_action.setEnabled(False)
+        startup_action = QAction(f"开机自启: {'已开启' if self.config.auto_start else '未开启'}", self)
+        startup_action.setEnabled(False)
         restart_action = QAction("重启", self)
         restart_action.triggered.connect(self.restart_app)
         quit_action = QAction("退出", self)
         quit_action.triggered.connect(self.quit)
         menu.addAction(settings_action)
+        menu.addAction(hotkey_action)
+        menu.addAction(startup_action)
         menu.addAction(restart_action)
         menu.addSeparator()
         menu.addAction(quit_action)
+        menu.aboutToShow.connect(self.suspend_hotkey_for_tray_menu)
+        menu.aboutToHide.connect(self.resume_hotkey_after_tray_menu)
         return menu
 
     def open_settings(self):
@@ -934,6 +957,8 @@ class AppTray(QApplication):
             self.window.update_launch_mode(self.config.launch_mode)
             self.window.update_hotkey(self.config.hotkey_modifiers, self.config.hotkey_key)
             self.update_tray_tooltip()
+            self.apply_auto_start_setting()
+            self.tray.setContextMenu(self.build_menu())
             self.sync_hotkey_registration()
         self.settings_dialog = None
 
@@ -944,6 +969,18 @@ class AppTray(QApplication):
     def restart_app(self):
         save_config(self.config)
         QApplication.exit(42)
+
+    def suspend_hotkey_for_tray_menu(self):
+        if self.menu_hotkey_suspended:
+            return
+        self.menu_hotkey_suspended = True
+        self.unregister_hotkey()
+
+    def resume_hotkey_after_tray_menu(self):
+        if not self.menu_hotkey_suspended:
+            return
+        self.menu_hotkey_suspended = False
+        self.sync_hotkey_registration()
 
     def sync_hotkey_registration(self):
         self.unregister_hotkey()
@@ -974,7 +1011,26 @@ class AppTray(QApplication):
 
     def update_tray_tooltip(self):
         hotkey_text = format_hotkey(self.config.hotkey_modifiers, self.config.hotkey_key)
-        self.tray.setToolTip(f"EdgeDockTool\n快捷键模式: {hotkey_text}")
+        startup_text = "已开启" if self.config.auto_start else "未开启"
+        self.tray.setToolTip(f"{APP_NAME}\n快捷键模式: {hotkey_text}\n开机自启: {startup_text}")
+
+    def get_startup_command(self) -> str:
+        script = Path(__file__).resolve().parent.parent / "main.py"
+        return f'"{sys.executable}" "{script}"'
+
+    def apply_auto_start_setting(self):
+        run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        try:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, run_key) as key:
+                if self.config.auto_start:
+                    winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, self.get_startup_command())
+                else:
+                    try:
+                        winreg.DeleteValue(key, APP_NAME)
+                    except FileNotFoundError:
+                        pass
+        except OSError:
+            pass
 
 
 def run():
