@@ -27,6 +27,8 @@ class ShortcutItem:
 class AppConfig:
     edge: str = "right"
     offset: int = 0
+    expanded_width: int = 340
+    expanded_height: int = 520
     hover_delay_ms: int = 1000
     hide_delay_ms: int = 240
     pinned_position: bool = False
@@ -41,6 +43,8 @@ class AppConfig:
         shortcuts = [ShortcutItem(**item) for item in data.get("shortcuts", [])]
         edge = data.get("edge", "right")
         offset = int(data.get("offset", 0))
+        expanded_width = int(data.get("expanded_width", 340))
+        expanded_height = int(data.get("expanded_height", 520))
         hover_delay_ms = int(data.get("hover_delay_ms", 1000))
         hide_delay_ms = int(data.get("hide_delay_ms", 240))
         pinned_position = bool(data.get("pinned_position", False))
@@ -59,9 +63,13 @@ class AppConfig:
             hotkey_key = "Space"
         hover_delay_ms = max(100, min(5000, hover_delay_ms))
         hide_delay_ms = max(0, min(5000, hide_delay_ms))
+        expanded_width = max(260, min(960, expanded_width))
+        expanded_height = max(220, min(960, expanded_height))
         return cls(
             edge=edge,
             offset=offset,
+            expanded_width=expanded_width,
+            expanded_height=expanded_height,
             hover_delay_ms=hover_delay_ms,
             hide_delay_ms=hide_delay_ms,
             pinned_position=pinned_position,
@@ -76,6 +84,8 @@ class AppConfig:
         return {
             "edge": self.edge,
             "offset": self.offset,
+            "expanded_width": self.expanded_width,
+            "expanded_height": self.expanded_height,
             "hover_delay_ms": self.hover_delay_ms,
             "hide_delay_ms": self.hide_delay_ms,
             "pinned_position": self.pinned_position,

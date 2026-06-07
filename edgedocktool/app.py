@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import os
 import sys
-from ctypes import POINTER, Structure, WinDLL, byref, c_void_p, wintypes
+from datetime import datetime
+from ctypes import POINTER, Structure, WinDLL, byref, c_short, c_void_p, wintypes
 from pathlib import Path
-from subprocess import Popen
+from subprocess import CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS, Popen, list2cmdline
 import winreg
 
-from PySide6.QtCore import QAbstractNativeEventFilter, QPoint, QRect, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QCursor, QDragEnterEvent, QDropEvent, QGuiApplication, QIcon, QKeyEvent, QPainter, QPixmap
+from PySide6.QtCore import QAbstractNativeEventFilter, QEvent, QPoint, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QCursor, QDragEnterEvent, QDropEvent, QGuiApplication, QIcon, QKeyEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -38,6 +40,9 @@ from .utils import display_name, item_kind, open_path
 
 APP_NAME = "EdgeDockTool"
 APP_VERSION = "0.1.3"
+RESTART_EXIT_CODE = 42
+DEBUG_RESIZE = os.environ.get("EDGE_DOCK_DEBUG_RESIZE") == "1"
+DEBUG_LOG_PATH = Path.cwd() / "edgedocktool-debug-live.log"
 
 EDGE_LABELS = {
     "left": "左侧",
@@ -56,8 +61,26 @@ MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 WM_HOTKEY = 0x0312
+WM_NCHITTEST = 0x0084
+HTTOPLEFT = 13
+HTTOPRIGHT = 14
+HTBOTTOMLEFT = 16
+HTBOTTOMRIGHT = 17
 
 user32 = WinDLL("user32", use_last_error=True)
+
+
+def debug_log(message: str) -> None:
+    if not DEBUG_RESIZE:
+        return
+    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    line = f"[EdgeDockDebug {timestamp}] {message}"
+    print(line, flush=True)
+    try:
+        with DEBUG_LOG_PATH.open("a", encoding="utf-8") as fp:
+            fp.write(line + "\n")
+    except OSError:
+        pass
 
 
 class MSG(Structure):
@@ -242,6 +265,8 @@ def create_file_icon(size: int = 72) -> QIcon:
 
 
 class ShortcutChip(QToolButton):
+    layout_width_hint = 132
+
     def __init__(self, item: ShortcutItem, parent: QWidget | None = None):
         super().__init__(parent)
         self.item = item
@@ -251,10 +276,92 @@ class ShortcutChip(QToolButton):
         self.setIconSize(QSize(56, 56))
         self.setCursor(Qt.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setMinimumWidth(self.layout_width_hint)
         self.setMinimumHeight(118)
         self.setToolTip(self.item.path)
         self.clicked.connect(lambda: open_path(self.item.path))
 
+
+class ResizeHandleWidget(QWidget):
+    def __init__(self, edge_window: "EdgeDockWindow", handle: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.edge_window = edge_window
+        self.handle = handle
+        self.setMouseTracking(True)
+        self.setStyleSheet("background: transparent;")
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        if DEBUG_RESIZE:
+            painter.setPen(QPen(QColor(255, 80, 80, 230), 2))
+            painter.setBrush(QColor(255, 80, 80, 45))
+            painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 8, 8)
+        self.setCursor(self.edge_window.resize_handle_cursor(self.handle))
+        size = min(self.width(), self.height()) - 12
+        x = (self.width() - size) // 2
+        y = (self.height() - size) // 2
+        active = self.edge_window.resize_mode == self.handle
+        guide = QColor(255, 255, 255, 190 if self.underMouse() or active else 120)
+        accent = QColor(245, 158, 11, 220 if active else 170)
+        painter.setPen(QPen(guide, 1.3))
+        if self.handle == "bottom_left":
+            painter.drawLine(x + size, y + 4, x + 4, y + size)
+            painter.drawLine(x + size, y + 9, x + 9, y + size)
+            painter.drawLine(x + size, y + 14, x + 14, y + size)
+        else:
+            painter.drawLine(x, y + 4, x + size - 4, y + size)
+            painter.drawLine(x, y + 9, x + size - 9, y + size)
+            painter.drawLine(x, y + 14, x + size - 14, y + size)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(accent)
+        painter.drawEllipse(self.rect().center(), 2, 2)
+        super().paintEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            window_handle = self.edge_window.windowHandle()
+            if window_handle is not None:
+                edges = self.edge_window.resize_handle_edges(self.handle)
+                accepted = window_handle.startSystemResize(edges)
+                debug_log(
+                    f"handle press={self.handle} system_resize={accepted} "
+                    f"global=({event.globalPosition().toPoint().x()},{event.globalPosition().toPoint().y()})"
+                )
+                if accepted:
+                    event.accept()
+                    return
+            else:
+                debug_log(f"handle press={self.handle} no_window_handle")
+            if self.edge_window.handle_resize_press(
+                self.edge_window.mapFromGlobal(event.globalPosition().toPoint()),
+                event.globalPosition().toPoint(),
+                self.handle,
+            ):
+                debug_log(f"handle press={self.handle} fallback_resize=True")
+                self.grabMouse()
+                event.accept()
+                return
+            debug_log(f"handle press={self.handle} fallback_resize=False")
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.edge_window.resize_mode is not None:
+            self.edge_window.resize_from_bottom_corner(event.globalPosition().toPoint())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.edge_window.resize_mode is not None:
+            self.releaseMouse()
+            self.edge_window.handle_resize_release(
+                self.edge_window.mapFromGlobal(event.globalPosition().toPoint())
+            )
+            debug_log(f"handle release={self.handle}")
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 class SettingsList(QListWidget):
     items_changed = Signal()
@@ -343,6 +450,8 @@ class SettingsDialog(QDialog):
         self.config = AppConfig(
             edge=config.edge,
             offset=config.offset,
+            expanded_width=config.expanded_width,
+            expanded_height=config.expanded_height,
             hover_delay_ms=config.hover_delay_ms,
             hide_delay_ms=config.hide_delay_ms,
             pinned_position=config.pinned_position,
@@ -523,15 +632,20 @@ class SettingsDialog(QDialog):
 class EdgeDockWindow(QWidget):
     collapsed_thickness = 28
     collapsed_length = 120
-    expanded_width = 340
-    expanded_height = 520
     hover_margin = 24
+    resize_hit_size = 24
+    min_expanded_width = 260
+    min_expanded_height = 220
+    max_expanded_width = 960
+    max_expanded_height = 960
 
     def __init__(self, config: AppConfig):
         super().__init__()
         self.config = config
         self.edge = config.edge
         self.offset = config.offset
+        self.expanded_width = config.expanded_width
+        self.expanded_height = config.expanded_height
         self.hover_delay_ms = config.hover_delay_ms
         self.hide_delay_ms = config.hide_delay_ms
         self.pinned_position = config.pinned_position
@@ -544,12 +658,18 @@ class EdgeDockWindow(QWidget):
         self.drag_origin_global: QPoint | None = None
         self.drag_origin_rect: QRect | None = None
         self.drag_started = False
+        self.init_complete = False
+        self.resize_origin_global: QPoint | None = None
+        self.resize_origin_width = self.expanded_width
+        self.resize_origin_height = self.expanded_height
+        self.resize_mode: str | None = None
         self.drag_hold_timer = QTimer(self)
         self.drag_hold_timer.setSingleShot(True)
         self.drag_hold_timer.timeout.connect(self.begin_drag_mode)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMouseTracking(True)
+        debug_log(f"window init debug_resize={DEBUG_RESIZE}")
 
         self.hover_delay = QTimer(self)
         self.hover_delay.setSingleShot(True)
@@ -564,6 +684,8 @@ class EdgeDockWindow(QWidget):
         self.poll_timer.start(120)
 
         self.card = QFrame(self)
+        self.card.installEventFilter(self)
+        self.card.setMouseTracking(True)
         self.card.setObjectName("card")
         self.card.setStyleSheet(
             """
@@ -612,11 +734,29 @@ class EdgeDockWindow(QWidget):
         self.collapsed_hint = QLabel("EDGE", self.card)
         self.collapsed_hint.setStyleSheet("color: rgba(255,255,255,0.85); font-size: 11px; font-weight: 700; letter-spacing: 1px;")
         self.collapsed_hint.setAlignment(Qt.AlignCenter)
+        self.debug_badge = QLabel("DEBUG RESIZE", self.card)
+        self.debug_badge.setStyleSheet(
+            "background: rgba(220, 38, 38, 0.92);"
+            "color: white;"
+            "padding: 4px 8px;"
+            "border-radius: 8px;"
+            "font-size: 11px;"
+            "font-weight: 700;"
+        )
+        self.debug_badge.adjustSize()
+        self.debug_badge.setVisible(DEBUG_RESIZE)
 
         self.scroll = QScrollArea(self.card)
         self.scroll.setWidgetResizable(True)
+        self.scroll.installEventFilter(self)
+        self.scroll.viewport().installEventFilter(self)
+        self.scroll.viewport().setMouseTracking(True)
         self.scroll.setStyleSheet("background: transparent; border: none;")
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll_widget = QWidget()
+        self.scroll_widget.installEventFilter(self)
+        self.scroll_widget.setMouseTracking(True)
         self.scroll_widget.setStyleSheet("background: transparent;")
         self.scroll_layout = QGridLayout(self.scroll_widget)
         self.scroll_layout.setContentsMargins(0, 0, 0, 0)
@@ -624,6 +764,11 @@ class EdgeDockWindow(QWidget):
         self.scroll_layout.setVerticalSpacing(14)
         self.scroll_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.scroll.setWidget(self.scroll_widget)
+        self.shortcut_widgets: list[ShortcutChip] = []
+        self.left_resize_handle = ResizeHandleWidget(self, "bottom_left", self)
+        self.right_resize_handle = ResizeHandleWidget(self, "bottom_right", self)
+        self.left_resize_handle.installEventFilter(self)
+        self.right_resize_handle.installEventFilter(self)
 
         layout = QVBoxLayout(self.card)
         layout.setContentsMargins(20, 18, 20, 18)
@@ -634,6 +779,7 @@ class EdgeDockWindow(QWidget):
         self.refresh_shortcuts()
         self.setGeometry(self.target_geometry(expanded=False))
         self.card.setGeometry(self.rect())
+        self.init_complete = True
         self.show()
 
     def refresh_shortcuts(self):
@@ -642,20 +788,49 @@ class EdgeDockWindow(QWidget):
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
+        self.shortcut_widgets = []
         if not self.config.shortcuts:
             empty = QLabel("右键托盘图标打开设置，然后拖进常用文件和文件夹。", self.scroll_widget)
             empty.setWordWrap(True)
             empty.setStyleSheet("color: rgba(226, 232, 240, 0.75); font-size: 13px;")
+            empty.installEventFilter(self)
+            empty.setMouseTracking(True)
             self.scroll_layout.addWidget(empty, 0, 0, 1, 2)
         else:
-            for index, item in enumerate(self.config.shortcuts):
-                row = index // 2
-                column = index % 2
-                self.scroll_layout.addWidget(ShortcutChip(item, self.scroll_widget), row, column)
-            self.scroll_layout.setColumnStretch(0, 1)
-            self.scroll_layout.setColumnStretch(1, 1)
-            self.scroll_layout.setRowStretch((len(self.config.shortcuts) + 1) // 2, 1)
+            self.shortcut_widgets = [ShortcutChip(item, self.scroll_widget) for item in self.config.shortcuts]
+            for widget in self.shortcut_widgets:
+                widget.installEventFilter(self)
+                widget.setMouseTracking(True)
+            self.relayout_shortcuts()
         self.update_collapsed_presentation()
+
+    def shortcut_column_count(self) -> int:
+        viewport_width = max(0, self.scroll.viewport().width())
+        margins = self.card.layout().contentsMargins()
+        usable_width = max(0, viewport_width - margins.left() - margins.right())
+        if usable_width <= 0:
+            usable_width = max(0, self.expanded_width - 40)
+        item_width = ShortcutChip.layout_width_hint
+        spacing = self.scroll_layout.horizontalSpacing() or 12
+        columns = max(1, (usable_width + spacing) // (item_width + spacing))
+        return min(6, columns)
+
+    def relayout_shortcuts(self):
+        if not self.shortcut_widgets:
+            return
+        while self.scroll_layout.count():
+            item = self.scroll_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(self.scroll_widget)
+        columns = self.shortcut_column_count()
+        for index, widget in enumerate(self.shortcut_widgets):
+            row = index // columns
+            column = index % columns
+            self.scroll_layout.addWidget(widget, row, column)
+        for column in range(columns):
+            self.scroll_layout.setColumnStretch(column, 1)
+        self.scroll_layout.setRowStretch((len(self.shortcut_widgets) + columns - 1) // columns, 1)
 
     def screen_for_cursor(self):
         return QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
@@ -679,7 +854,7 @@ class EdgeDockWindow(QWidget):
 
         if self.edge in {"left", "right"}:
             width = self.expanded_width if expanded else self.collapsed_thickness
-            height = min(self.expanded_height, max(180, geo.height() - 120)) if expanded else self.collapsed_length
+            height = min(self.expanded_height, max(self.min_expanded_height, geo.height() - 120)) if expanded else self.collapsed_length
             min_y = geo.top() + 20
             max_y = geo.bottom() - height - 20
             centered_y = geo.top() + max(30, (geo.height() - height) // 2)
@@ -691,7 +866,7 @@ class EdgeDockWindow(QWidget):
             return QRect(x, y, width, height)
 
         height = self.expanded_height if expanded else self.collapsed_thickness
-        width = min(self.expanded_width, max(220, geo.width() - 160)) if expanded else 140
+        width = min(self.expanded_width, max(self.min_expanded_width, geo.width() - 160)) if expanded else 140
         min_x = geo.left() + 20
         max_x = geo.right() - width - 20
         centered_x = geo.left() + max(40, (geo.width() - width) // 2)
@@ -801,18 +976,227 @@ class EdgeDockWindow(QWidget):
 
     def resizeEvent(self, event):
         self.card.setGeometry(self.rect())
+        self.debug_badge.move(12, 10)
+        self.debug_badge.raise_()
+        self.position_resize_handles()
         if not self.expanded:
             self.collapsed_hint.setGeometry(self.card.rect())
+        else:
+            self.expanded_width = self.width()
+            self.expanded_height = self.height()
+            self.config.expanded_width = self.expanded_width
+            self.config.expanded_height = self.expanded_height
+            if self.shortcut_widgets:
+                self.relayout_shortcuts()
         super().resizeEvent(event)
+
+    def nativeEvent(self, eventType, message):
+        if eventType == b"windows_generic_MSG":
+            msg = MSG.from_address(int(message))
+            if msg.message == WM_NCHITTEST and self.expanded:
+                x = c_short(msg.lParam & 0xFFFF).value
+                y = c_short((msg.lParam >> 16) & 0xFFFF).value
+                handle = self.hit_test_resize_handle(self.mapFromGlobal(QPoint(x, y)))
+                if handle == "bottom_left":
+                    return True, HTBOTTOMLEFT
+                if handle == "bottom_right":
+                    return True, HTBOTTOMRIGHT
+                if handle == "top_left":
+                    return True, HTTOPLEFT
+                if handle == "top_right":
+                    return True, HTTOPRIGHT
+        return super().nativeEvent(eventType, message)
+
+    def leaveEvent(self, event):
+        if self.resize_mode is None and self.drag_origin_global is None:
+            self.unsetCursor()
+        super().leaveEvent(event)
+
+    def active_resize_handles(self) -> tuple[str, str]:
+        if self.edge == "top":
+            return ("bottom_left", "bottom_right")
+        if self.edge == "bottom":
+            return ("top_left", "top_right")
+        if self.edge == "left":
+            return ("top_right", "bottom_right")
+        return ("top_left", "bottom_left")
+
+    def resize_handle_edges(self, handle: str):
+        edge_map = {
+            "top_left": Qt.TopEdge | Qt.LeftEdge,
+            "top_right": Qt.TopEdge | Qt.RightEdge,
+            "bottom_left": Qt.BottomEdge | Qt.LeftEdge,
+            "bottom_right": Qt.BottomEdge | Qt.RightEdge,
+        }
+        return edge_map[handle]
+
+    def resize_handle_cursor(self, handle: str):
+        if handle in {"top_left", "bottom_right"}:
+            return Qt.SizeFDiagCursor
+        return Qt.SizeBDiagCursor
+
+    def resize_handle_rect(self, handle: str) -> QRect:
+        handle_width = 72
+        handle_height = 44
+        x = 0 if "left" in handle else max(0, self.width() - handle_width)
+        y = 0 if "top" in handle else max(0, self.height() - handle_height)
+        return QRect(x, y, handle_width, handle_height)
+
+    def position_resize_handles(self):
+        left_handle, right_handle = self.active_resize_handles()
+        self.left_resize_handle.handle = left_handle
+        self.right_resize_handle.handle = right_handle
+        self.left_resize_handle.setGeometry(self.resize_handle_rect(left_handle))
+        self.right_resize_handle.setGeometry(self.resize_handle_rect(right_handle))
+        self.left_resize_handle.raise_()
+        self.right_resize_handle.raise_()
+        if DEBUG_RESIZE and self.expanded:
+            debug_log(
+                "handle rects "
+                f"left={self.left_resize_handle.geometry().getRect()} "
+                f"right={self.right_resize_handle.geometry().getRect()} "
+                f"window={self.geometry().getRect()}"
+            )
+
+    def hit_test_resize_handle(self, local_pos: QPoint) -> str | None:
+        if not self.expanded:
+            return None
+        left_handle, right_handle = self.active_resize_handles()
+        left_zone = self.resize_handle_rect(left_handle)
+        right_zone = self.resize_handle_rect(right_handle)
+        if left_zone.contains(local_pos):
+            return left_handle
+        if right_zone.contains(local_pos):
+            return right_handle
+        return None
+
+    def map_event_to_window_pos(self, watched: QObject, event) -> QPoint:
+        if hasattr(event, "position"):
+            local_pos = event.position().toPoint()
+        else:
+            local_pos = QPoint()
+        if watched is self:
+            return local_pos
+        if isinstance(watched, QWidget):
+            return self.mapFromGlobal(watched.mapToGlobal(local_pos))
+        return local_pos
+
+    def handle_resize_press(self, window_pos: QPoint, global_pos: QPoint, forced_mode: str | None = None) -> bool:
+        resize_mode = forced_mode or self.hit_test_resize_handle(window_pos)
+        debug_log(
+            f"handle_resize_press forced={forced_mode} detected={resize_mode} "
+            f"window_pos=({window_pos.x()},{window_pos.y()}) global=({global_pos.x()},{global_pos.y()})"
+        )
+        if resize_mode is None:
+            return False
+        self.resize_mode = resize_mode
+        self.resize_origin_global = global_pos
+        self.resize_origin_width = self.expanded_width
+        self.resize_origin_height = self.expanded_height
+        self.drag_hold_timer.stop()
+        self.hover_delay.stop()
+        self.collapse_delay.stop()
+        self.update()
+        return True
+
+    def handle_resize_release(self, window_pos: QPoint) -> bool:
+        if self.resize_mode is None:
+            return False
+        debug_log(
+            f"handle_resize_release mode={self.resize_mode} "
+            f"size=({self.expanded_width},{self.expanded_height}) "
+            f"window_pos=({window_pos.x()},{window_pos.y()})"
+        )
+        save_config(self.config)
+        self.resize_mode = None
+        self.resize_origin_global = None
+        self.sync_resize_cursor(window_pos)
+        self.update()
+        return True
+
+    def eventFilter(self, watched, event):
+        if not self.init_complete or event is None:
+            return super().eventFilter(watched, event)
+        event_type = event.type()
+        mouse_sources = {
+            self.card,
+            self.scroll,
+            self.scroll.viewport(),
+            self.scroll_widget,
+            self.left_resize_handle,
+            self.right_resize_handle,
+            *self.shortcut_widgets,
+        }
+        if watched in mouse_sources:
+            if event_type == QEvent.MouseButtonPress and hasattr(event, "button") and event.button() == Qt.LeftButton:
+                window_pos = self.map_event_to_window_pos(watched, event)
+                global_pos = event.globalPosition().toPoint()
+                forced_mode = watched.handle if isinstance(watched, ResizeHandleWidget) else None
+                if self.handle_resize_press(window_pos, global_pos, forced_mode):
+                    event.accept()
+                    return True
+            if event_type == QEvent.MouseMove:
+                window_pos = self.map_event_to_window_pos(watched, event)
+                if self.resize_mode is not None and hasattr(event, "globalPosition"):
+                    self.resize_from_bottom_corner(event.globalPosition().toPoint())
+                    event.accept()
+                    return True
+                self.sync_resize_cursor(window_pos)
+            if event_type == QEvent.MouseButtonRelease and hasattr(event, "button") and event.button() == Qt.LeftButton:
+                window_pos = self.map_event_to_window_pos(watched, event)
+                if self.handle_resize_release(window_pos):
+                    event.accept()
+                    return True
+        return super().eventFilter(watched, event)
+
+    def sync_resize_cursor(self, local_pos: QPoint):
+        if self.resize_mode is not None:
+            return
+        handle = self.hit_test_resize_handle(local_pos)
+        if handle is not None:
+            self.setCursor(self.resize_handle_cursor(handle))
+        else:
+            self.unsetCursor()
+        self.update()
+
+    def apply_resized_dimensions(self, width: int, height: int):
+        self.expanded_width = max(self.min_expanded_width, min(self.max_expanded_width, width))
+        self.expanded_height = max(self.min_expanded_height, min(self.max_expanded_height, height))
+        self.config.expanded_width = self.expanded_width
+        self.config.expanded_height = self.expanded_height
+        if DEBUG_RESIZE:
+            debug_log(f"apply_resized_dimensions width={self.expanded_width} height={self.expanded_height}")
+        self.setGeometry(self.target_geometry(expanded=True))
+        self.card.setGeometry(self.rect())
+
+    def resize_from_bottom_corner(self, current: QPoint):
+        if self.resize_mode is None or self.resize_origin_global is None:
+            return
+        delta = current - self.resize_origin_global
+        width = self.resize_origin_width
+        if "left" in self.resize_mode:
+            width -= delta.x()
+        else:
+            width += delta.x()
+        if "top" in self.resize_mode:
+            height = self.resize_origin_height - delta.y()
+        else:
+            height = self.resize_origin_height + delta.y()
+        self.apply_resized_dimensions(width, height)
+        self.update()
 
     def update_collapsed_presentation(self):
         collapsed = not self.expanded
         self.scroll.setVisible(not collapsed)
         self.collapsed_hint.setVisible(collapsed)
+        handles_visible = self.expanded
+        self.left_resize_handle.setVisible(handles_visible)
+        self.right_resize_handle.setVisible(handles_visible)
         if collapsed:
             self.card.layout().setContentsMargins(0, 0, 0, 0)
             self.card.layout().setSpacing(0)
             self.collapsed_hint.setGeometry(self.card.rect())
+            self.debug_badge.setVisible(DEBUG_RESIZE)
             if self.edge in {"left", "right"}:
                 self.collapsed_hint.setText("EDGE")
             else:
@@ -820,6 +1204,7 @@ class EdgeDockWindow(QWidget):
         else:
             self.card.layout().setContentsMargins(20, 18, 20, 18)
             self.card.layout().setSpacing(12)
+            self.debug_badge.setVisible(DEBUG_RESIZE)
 
     def begin_drag_mode(self):
         self.drag_started = True
@@ -828,12 +1213,12 @@ class EdgeDockWindow(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
+            if self.handle_resize_press(event.position().toPoint(), event.globalPosition().toPoint()):
+                event.accept()
+                return
             if self.launch_mode == "hotkey" and not self.pinned_position:
-                if self.geometry().adjusted(-10, -10, 10, 10).contains(event.globalPosition().toPoint()):
-                    if self.expanded:
-                        self.collapse()
-                    else:
-                        self.expand()
+                if not self.expanded and self.geometry().adjusted(-10, -10, 10, 10).contains(event.globalPosition().toPoint()):
+                    self.expand()
                     super().mousePressEvent(event)
                     return
             if self.pinned_position:
@@ -846,7 +1231,12 @@ class EdgeDockWindow(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self.resize_mode is not None:
+            self.resize_from_bottom_corner(event.globalPosition().toPoint())
+            event.accept()
+            return
         if self.drag_origin_global is None or self.drag_origin_rect is None:
+            self.sync_resize_cursor(event.position().toPoint())
             super().mouseMoveEvent(event)
             return
 
@@ -879,15 +1269,20 @@ class EdgeDockWindow(QWidget):
         self.setGeometry(self.target_geometry(self.expanded))
         self.card.setGeometry(self.rect())
         self.update_collapsed_presentation()
+        self.sync_resize_cursor(event.position().toPoint())
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.handle_resize_release(event.position().toPoint()):
+            event.accept()
+            return
         self.drag_hold_timer.stop()
         if self.drag_started:
             save_config(self.config)
         self.drag_origin_global = None
         self.drag_origin_rect = None
         self.drag_started = False
+        self.sync_resize_cursor(event.position().toPoint())
         super().mouseReleaseEvent(event)
 
 
@@ -971,7 +1366,7 @@ class AppTray(QApplication):
 
     def restart_app(self):
         save_config(self.config)
-        QApplication.exit(42)
+        QApplication.exit(RESTART_EXIT_CODE)
 
     def set_hotkey_blocked(self, blocked: bool):
         self.hotkey_blocked = blocked
@@ -1012,9 +1407,20 @@ class AppTray(QApplication):
         startup_text = "已开启" if self.config.auto_start else "未开启"
         self.tray.setToolTip(f"{APP_NAME}\n快捷键模式: {hotkey_text}\n开机自启: {startup_text}")
 
-    def get_startup_command(self) -> str:
+    def get_launch_args(self) -> list[str]:
+        if getattr(sys, "frozen", False):
+            return [sys.executable]
+
         script = Path(__file__).resolve().parent.parent / "main.py"
-        return f'"{sys.executable}" "{script}"'
+        executable = Path(sys.executable)
+        if executable.name.lower() == "python.exe":
+            pythonw = executable.with_name("pythonw.exe")
+            if pythonw.exists():
+                return [str(pythonw), str(script)]
+        return [sys.executable, str(script)]
+
+    def get_startup_command(self) -> str:
+        return list2cmdline(self.get_launch_args())
 
     def apply_auto_start_setting(self):
         run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -1034,5 +1440,11 @@ class AppTray(QApplication):
 def run():
     app = AppTray(sys.argv)
     code = app.exec()
-    if code == 42:
-        Popen([sys.executable, str(Path(__file__).resolve().parent.parent / "main.py")])
+    if code == RESTART_EXIT_CODE:
+        Popen(
+            app.get_launch_args(),
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+            cwd=str(Path.cwd()),
+            env=os.environ.copy(),
+        )
