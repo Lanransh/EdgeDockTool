@@ -2,30 +2,26 @@
 setlocal
 cd /d "%~dp0"
 
-set LOGFILE=%~dp0edgedocktool-startup.log
+set "LOGFILE=%~dp0edgedocktool-startup.log"
+set "PYW="
 
-python -c "import PySide6" >nul 2>nul
-if errorlevel 1 (
-    echo Installing dependencies...
-    python -m pip install -r requirements.txt
-    if errorlevel 1 (
-        echo Dependency install failed.
-        pause
-        exit /b 1
-    )
+where pythonw >nul 2>nul
+if not errorlevel 1 (
+    set "PYW=pythonw"
+) else (
+    if exist "%LocalAppData%\Programs\Python\Python312\pythonw.exe" set "PYW=%LocalAppData%\Programs\Python\Python312\pythonw.exe"
 )
 
-echo Starting EdgeDockTool...
-python "%~dp0main.py" 1>>"%LOGFILE%" 2>&1
-set EXITCODE=%ERRORLEVEL%
+if exist "%~dp0dist\EdgeDockTool.exe" (
+    start "" "%~dp0dist\EdgeDockTool.exe"
+    exit /b 0
+)
 
-if not "%EXITCODE%"=="0" (
-    echo.
-    echo Startup failed. Exit code: %EXITCODE%
-    echo Log file: %LOGFILE%
-    echo.
-    type "%LOGFILE%"
-    echo.
+if not defined PYW (
+    echo pythonw.exe not found. Please install Python or use dist\EdgeDockTool.exe.
     pause
-    exit /b %EXITCODE%
+    exit /b 1
 )
+
+start "" "%PYW%" "%~dp0main.py" 1>>"%LOGFILE%" 2>&1
+exit /b 0

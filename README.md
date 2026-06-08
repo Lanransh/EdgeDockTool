@@ -29,7 +29,11 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
-也可以直接双击 `启动EdgeDockTool.bat`。
+更像普通软件的方式：
+
+- 优先双击 `dist\EdgeDockTool.exe`
+- 或双击 `启动EdgeDockTool.bat`，它现在会优先拉起无控制台窗口版本
+- 排查报错时可双击 `测试启动EdgeDockTool.bat`，会保留命令行窗口并输出日志
 
 ## 配置说明
 
