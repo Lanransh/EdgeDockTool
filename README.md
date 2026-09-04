@@ -32,8 +32,8 @@ python main.py
 
 更像普通软件的方式：
 
-- 优先双击 `dist\EdgeDockTool.exe`
-- 或双击 `启动EdgeDockTool.bat`，它现在会优先拉起无控制台窗口版本
+- 下载仓库后直接双击 `release\EdgeDockTool.exe`，无需安装 Python
+- 或双击 `启动EdgeDockTool.bat`，脚本会优先启动仓库内的发布版
 - 排查报错时可双击 `测试启动EdgeDockTool.bat`，会保留命令行窗口并输出日志
 
 双击普通启动脚本后窗口会立即关闭，这是脚本把程序放到后台运行的正常表现；程序运行后会留在系统托盘。若 Alt+Space 没有反应，请先在任务管理器结束旧的 EdgeDockTool Python 进程，再重新双击启动脚本。也可以直接在项目目录运行 `.venv\Scripts\python.exe main.py` 观察报错。

@@ -15,6 +15,11 @@ if exist "%~dp0.venv\Scripts\pythonw.exe" (
     )
 )
 
+if exist "%~dp0release\EdgeDockTool.exe" (
+    start "" "%~dp0release\EdgeDockTool.exe"
+    exit /b 0
+)
+
 if exist "%~dp0dist\EdgeDockTool.exe" (
     start "" "%~dp0dist\EdgeDockTool.exe"
     exit /b 0
