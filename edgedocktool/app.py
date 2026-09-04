@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import os
 import sys
+import time
+import traceback
+from datetime import datetime
 from ctypes import Structure, WinDLL, byref, c_int, c_size_t, c_void_p, cast, sizeof, wintypes
 from pathlib import Path
 from subprocess import CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS, Popen, list2cmdline
@@ -21,6 +24,7 @@ from PySide6.QtCore import (
     QSize,
     Qt,
     QTimer,
+    QSharedMemory,
     Signal,
 )
 from PySide6.QtGui import (
@@ -58,6 +62,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 from .config import AppConfig, ShortcutItem, load_config, save_config
 from .utils import display_name, item_kind, open_path
@@ -65,6 +70,7 @@ from .utils import display_name, item_kind, open_path
 APP_NAME = "EdgeDockTool"
 APP_VERSION = "0.2.0"
 RESTART_EXIT_CODE = 42
+INSTANCE_SERVER_NAME = "EdgeDockTool.SingleInstance.v1"
 HOTKEY_ID = 1
 WM_HOTKEY = 0x0312
 MOD_ALT = 0x0001
@@ -72,6 +78,7 @@ MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 
 MODIFIER_FLAGS = {"Ctrl": MOD_CONTROL, "Alt": MOD_ALT, "Shift": MOD_SHIFT}
+MODIFIER_VKEYS = {"Ctrl": 0x11, "Alt": 0x12, "Shift": 0x10}
 VIRTUAL_KEYS = {"Space": 0x20, **{f"F{i}": 0x6F + i for i in range(1, 13)}}
 VIRTUAL_KEYS.update({chr(code): code for code in range(ord("A"), ord("Z") + 1)})
 
@@ -79,6 +86,27 @@ if os.name == "nt":
     user32 = WinDLL("user32", use_last_error=True)
 else:  # pragma: no cover - allows importing the module for tooling on other platforms
     user32 = None
+
+
+def append_diagnostic(message: str) -> None:
+    try:
+        base = Path(os.environ.get("APPDATA") or Path.home()) / APP_NAME
+        base.mkdir(parents=True, exist_ok=True)
+        with (base / "error.log").open("a", encoding="utf-8") as log:
+            log.write(f"[{datetime.now().isoformat(timespec='seconds')}] {message.rstrip()}\n")
+    except OSError:
+        pass
+
+
+def install_exception_logger() -> None:
+    previous_hook = sys.excepthook
+
+    def log_exception(exc_type, exc_value, exc_traceback):
+        append_diagnostic("".join(traceback.format_exception(exc_type, exc_value, exc_traceback)))
+        if sys.stderr is not None:
+            previous_hook(exc_type, exc_value, exc_traceback)
+
+    sys.excepthook = log_exception
 
 
 class MSG(Structure):
@@ -116,7 +144,12 @@ class HotkeyFilter(QAbstractNativeEventFilter):
         self.callback = callback
 
     def nativeEventFilter(self, event_type, message):
-        if event_type != b"windows_generic_MSG":
+        if not isinstance(event_type, str):
+            try:
+                event_type = bytes(event_type).decode(errors="ignore")
+            except (TypeError, ValueError):
+                event_type = str(event_type)
+        if event_type not in {"windows_generic_MSG", "windows_dispatcher_MSG"}:
             return False, 0
         msg = MSG.from_address(int(message))
         if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
@@ -432,11 +465,12 @@ class LauncherWindow(QWidget):
         self.buttons: list[ShortcutButton] = []
         self.animating = False
         self._backdrop_applied = False
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
+        self._backdrop_attempted = False
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.Popup | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMinimumSize(540, 360)
         self.setWindowTitle(APP_NAME)
-        self.setStyleSheet("QWidget#panel { background: rgba(20, 20, 22, 224); border: 1px solid rgba(255,255,255,0.18); border-radius: 18px; }")
+        self.setStyleSheet("QWidget#panel { background: rgba(20, 20, 22, 145); border: 1px solid rgba(255,255,255,0.18); border-radius: 18px; }")
 
         self.panel = QFrame(self)
         self.panel.setObjectName("panel")
@@ -540,14 +574,16 @@ class LauncherWindow(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        if not self._backdrop_applied:
+        if not self._backdrop_attempted:
             self._apply_backdrop()
 
     def _apply_backdrop(self):
+        self._backdrop_attempted = True
         handle = self.windowHandle()
         if handle is None or os.name != "nt":
             return
         hwnd = None
+        failures = []
         try:
             hwnd = int(handle.winId())
             dwm = WinDLL("dwmapi", use_last_error=True)
@@ -555,22 +591,30 @@ class LauncherWindow(QWidget):
             corner = c_int(2)  # DWMWCP_ROUND
             backdrop_result = dwm.DwmSetWindowAttribute(hwnd, 38, byref(backdrop), 4)
             dwm.DwmSetWindowAttribute(hwnd, 33, byref(corner), 4)
-            if backdrop_result == 0:
-                self._backdrop_applied = True
-                return
-        except (OSError, AttributeError):
-            pass
+            self._backdrop_applied = backdrop_result == 0
+            if backdrop_result != 0:
+                failures.append(f"DwmSetWindowAttribute returned {backdrop_result}")
+        except (OSError, AttributeError) as error:
+            failures.append(f"DWM backdrop failed: {error}")
 
-        # Windows 10 and older Windows 11 builds do not expose the system
-        # backdrop attribute, so use the legacy acrylic composition API.
+        # Also try the legacy acrylic composition API. It is a useful fallback
+        # on older Windows builds and gives a stronger blur on some Win11 themes.
         if user32 is None or hwnd is None:
             return
         try:
-            policy = ACCENT_POLICY(4, 0, 0xCC141416, 0)  # ACCENT_ENABLE_ACRYLICBLURBEHIND
+            policy = ACCENT_POLICY(4, 2, 0xCC141416, 0)  # ACCENT_ENABLE_ACRYLICBLURBEHIND
             data = WINDOWCOMPOSITIONATTRIBDATA(19, cast(byref(policy), c_void_p), c_size_t(sizeof(policy)))
-            self._backdrop_applied = bool(user32.SetWindowCompositionAttribute(hwnd, byref(data)))
-        except (OSError, AttributeError):
-            self._backdrop_applied = False
+            set_composition = user32.SetWindowCompositionAttribute
+            set_composition.argtypes = [wintypes.HWND, c_void_p]
+            set_composition.restype = wintypes.BOOL
+            acrylic_applied = bool(set_composition(hwnd, byref(data)))
+            self._backdrop_applied = acrylic_applied or self._backdrop_applied
+            if not acrylic_applied:
+                failures.append("SetWindowCompositionAttribute returned false")
+        except (OSError, AttributeError) as error:
+            failures.append(f"Acrylic backdrop failed: {error}")
+        if not self._backdrop_applied:
+            append_diagnostic("Backdrop unavailable; using translucent fallback. " + "; ".join(failures))
 
     def toggle(self):
         if self.isVisible() and not self.animating:
@@ -652,11 +696,6 @@ class LauncherWindow(QWidget):
             return
         super().keyPressEvent(event)
 
-    def changeEvent(self, event):
-        if event.type() == QEvent.WindowDeactivate and self.isVisible() and not self.animating:
-            self.hide_popup()
-        super().changeEvent(event)
-
     def resizeEvent(self, event):
         self.panel.setGeometry(self.rect())
         self.relayout()
@@ -666,6 +705,18 @@ class LauncherWindow(QWidget):
 class AppTray(QApplication):
     def __init__(self, argv: list[str]):
         super().__init__(argv)
+        self.already_running = False
+        self._instance_guard = QSharedMemory(INSTANCE_SERVER_NAME, self)
+        if not self._instance_guard.create(1):
+            self._notify_existing_instance()
+            self.already_running = True
+            return
+        self.instance_server = QLocalServer(self)
+        QLocalServer.removeServer(INSTANCE_SERVER_NAME)
+        if self.instance_server.listen(INSTANCE_SERVER_NAME):
+            self.instance_server.newConnection.connect(self._accept_instance_connection)
+        else:
+            append_diagnostic(f"Could not start instance server: {self.instance_server.errorString()}")
         self.setApplicationName(APP_NAME)
         self.setApplicationVersion(APP_VERSION)
         self.setQuitOnLastWindowClosed(False)
@@ -677,6 +728,12 @@ class AppTray(QApplication):
         self.installNativeEventFilter(self.hotkey_filter)
         self.hotkey_registered = False
         self.hotkey_blocked = False
+        self._polled_hotkey_down = False
+        self._last_hotkey_toggle = 0.0
+        self.hotkey_poll_timer = QTimer(self)
+        self.hotkey_poll_timer.setInterval(35)
+        self.hotkey_poll_timer.timeout.connect(self.poll_hotkey_fallback)
+        self.hotkey_poll_timer.start()
 
         self.tray = QSystemTrayIcon(self.icon, self)
         self.tray.setToolTip(self._tray_tooltip())
@@ -687,6 +744,30 @@ class AppTray(QApplication):
         self.apply_auto_start_setting()
         if not self.config.shortcuts:
             QTimer.singleShot(250, self.open_settings)
+
+    def _notify_existing_instance(self):
+        socket = QLocalSocket(self)
+        socket.connectToServer(INSTANCE_SERVER_NAME)
+        if socket.waitForConnected(700):
+            socket.write(b"show")
+            socket.waitForBytesWritten(700)
+            socket.disconnectFromServer()
+
+    def _accept_instance_connection(self):
+        while self.instance_server.hasPendingConnections():
+            socket = self.instance_server.nextPendingConnection()
+            socket.readyRead.connect(lambda socket=socket: self._read_instance_command(socket))
+            if socket.bytesAvailable():
+                self._read_instance_command(socket)
+
+    def _read_instance_command(self, socket: QLocalSocket):
+        if bytes(socket.readAll()).strip() == b"show":
+            if self.window.isVisible():
+                self.window.raise_()
+                self.window.activateWindow()
+            else:
+                self.window.show_popup()
+        socket.disconnectFromServer()
 
     def _tray_tooltip(self) -> str:
         return f"{APP_NAME}\n快捷键: {format_hotkey(self.config.hotkey_modifiers, self.config.hotkey_key)}"
@@ -782,7 +863,23 @@ class AppTray(QApplication):
             self.hotkey_registered = False
 
     def toggle_window_from_hotkey(self):
+        now = time.monotonic()
+        if now - self._last_hotkey_toggle < 0.16:
+            return
+        self._last_hotkey_toggle = now
         self.window.toggle()
+
+    def poll_hotkey_fallback(self):
+        if self.hotkey_blocked or user32 is None:
+            self._polled_hotkey_down = False
+            return
+        virtual_key = VIRTUAL_KEYS.get(self.config.hotkey_key, VIRTUAL_KEYS["Space"])
+        keys = [MODIFIER_VKEYS[item] for item in self.config.hotkey_modifiers if item in MODIFIER_VKEYS]
+        keys.append(virtual_key)
+        pressed = all(bool(user32.GetAsyncKeyState(key) & 0x8000) for key in keys)
+        if pressed and not self._polled_hotkey_down and time.monotonic() - self._last_hotkey_toggle >= 0.16:
+            self.toggle_window_from_hotkey()
+        self._polled_hotkey_down = pressed
 
     def get_launch_args(self) -> list[str]:
         if getattr(sys, "frozen", False):
@@ -812,9 +909,15 @@ class AppTray(QApplication):
 
 
 def run():
+    install_exception_logger()
     app = AppTray(sys.argv)
+    if app.already_running:
+        return
     code = app.exec()
     if code == RESTART_EXIT_CODE:
+        app.instance_server.close()
+        if app._instance_guard.isAttached():
+            app._instance_guard.detach()
         Popen(
             app.get_launch_args(),
             creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,

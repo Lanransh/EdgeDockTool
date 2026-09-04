@@ -36,12 +36,17 @@ python main.py
 - 或双击 `启动EdgeDockTool.bat`，它现在会优先拉起无控制台窗口版本
 - 排查报错时可双击 `测试启动EdgeDockTool.bat`，会保留命令行窗口并输出日志
 
+双击普通启动脚本后窗口会立即关闭，这是脚本把程序放到后台运行的正常表现；程序运行后会留在系统托盘。若 Alt+Space 没有反应，请先在任务管理器结束旧的 EdgeDockTool Python 进程，再重新双击启动脚本。也可以直接在项目目录运行 `.venv\Scripts\python.exe main.py` 观察报错。
+
+重复启动会直接唤醒正在运行的面板。后台运行异常以及毛玻璃降级原因记录在 `%APPDATA%\EdgeDockTool\error.log`。
+
 ## 配置说明
 
 - 程序配置会保存在 `%APPDATA%\EdgeDockTool\config.json`
 - 仓库中不保存你的本地快捷入口数据
 - 如果配置损坏，程序会自动回退到默认配置
 - 默认快捷键是 `Alt + Space`，可在设置中重新录入
+- 从旧版边缘停靠版本升级时，会自动迁移到 `Alt + Space`
 
 ## 技术栈
 

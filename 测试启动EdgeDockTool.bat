@@ -5,6 +5,13 @@ cd /d "%~dp0"
 set "LOGFILE=%~dp0edgedocktool-debug.log"
 set "LIVELOG=%~dp0edgedocktool-debug-live.log"
 set "EDGE_DOCK_DEBUG_RESIZE=1"
+set "PYTHON="
+
+if exist "%~dp0.venv\Scripts\python.exe" (
+    set "PYTHON=%~dp0.venv\Scripts\python.exe"
+) else (
+    set "PYTHON=python"
+)
 
 if exist "%LIVELOG%" del "%LIVELOG%"
 
@@ -12,7 +19,7 @@ echo [EdgeDockTool] Debug mode starting...
 echo Log file: %LOGFILE%
 echo.
 
-python -c "import PySide6" >nul 2>nul
+"%PYTHON%" -c "import PySide6" >nul 2>nul
 if errorlevel 1 (
     echo PySide6 is not installed.
     echo Please run: python -m pip install -r requirements.txt
@@ -21,7 +28,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-python "%~dp0main.py" 1>>"%LOGFILE%" 2>&1
+"%PYTHON%" "%~dp0main.py" 1>>"%LOGFILE%" 2>&1
 set "EXITCODE=%ERRORLEVEL%"
 
 echo.

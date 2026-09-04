@@ -32,6 +32,9 @@ class AppConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AppConfig":
+        # Configs from the edge-dock release used these fields. The new
+        # launcher intentionally starts with the requested Alt + Space default.
+        legacy_edge_config = "edge" in data or "launch_mode" in data
         shortcuts = []
         for item in data.get("shortcuts", []):
             try:
@@ -39,15 +42,18 @@ class AppConfig:
             except (TypeError, KeyError):
                 continue
 
-        hotkey_modifiers = [
-            item
-            for item in data.get("hotkey_modifiers", ["Alt"])
-            if item in {"Ctrl", "Alt", "Shift"}
-        ]
+        if legacy_edge_config:
+            hotkey_modifiers = ["Alt"]
+            hotkey_key = "Space"
+        else:
+            hotkey_modifiers = [
+                item
+                for item in data.get("hotkey_modifiers", ["Alt"])
+                if item in {"Ctrl", "Alt", "Shift"}
+            ]
+            hotkey_key = str(data.get("hotkey_key", "Space")) or "Space"
         if not hotkey_modifiers:
             hotkey_modifiers = ["Alt"]
-
-        hotkey_key = str(data.get("hotkey_key", "Space")) or "Space"
         return cls(
             auto_start=bool(data.get("auto_start", False)),
             hotkey_modifiers=hotkey_modifiers,
