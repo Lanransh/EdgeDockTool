@@ -25,56 +25,31 @@ class ShortcutItem:
 
 @dataclass
 class AppConfig:
-    edge: str = "right"
-    offset: int = 0
-    expanded_width: int = 340
-    expanded_height: int = 520
-    hover_delay_ms: int = 1000
-    hide_delay_ms: int = 240
-    pinned_position: bool = False
-    launch_mode: str = "hover"
     auto_start: bool = False
-    hotkey_modifiers: list[str] = field(default_factory=lambda: ["Ctrl", "Alt"])
+    hotkey_modifiers: list[str] = field(default_factory=lambda: ["Alt"])
     hotkey_key: str = "Space"
     shortcuts: list[ShortcutItem] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AppConfig":
-        shortcuts = [ShortcutItem(**item) for item in data.get("shortcuts", [])]
-        edge = data.get("edge", "right")
-        offset = int(data.get("offset", 0))
-        expanded_width = int(data.get("expanded_width", 340))
-        expanded_height = int(data.get("expanded_height", 520))
-        hover_delay_ms = int(data.get("hover_delay_ms", 1000))
-        hide_delay_ms = int(data.get("hide_delay_ms", 240))
-        pinned_position = bool(data.get("pinned_position", False))
-        launch_mode = str(data.get("launch_mode", "hover"))
-        auto_start = bool(data.get("auto_start", False))
-        hotkey_modifiers = list(data.get("hotkey_modifiers", ["Ctrl", "Alt"]))
-        hotkey_key = str(data.get("hotkey_key", "Space"))
-        if edge not in {"left", "right", "top", "bottom"}:
-            edge = "right"
-        if launch_mode not in {"hover", "hotkey"}:
-            launch_mode = "hover"
-        hotkey_modifiers = [item for item in hotkey_modifiers if item in {"Ctrl", "Alt", "Shift"}]
+        shortcuts = []
+        for item in data.get("shortcuts", []):
+            try:
+                shortcuts.append(ShortcutItem(**item))
+            except (TypeError, KeyError):
+                continue
+
+        hotkey_modifiers = [
+            item
+            for item in data.get("hotkey_modifiers", ["Alt"])
+            if item in {"Ctrl", "Alt", "Shift"}
+        ]
         if not hotkey_modifiers:
-            hotkey_modifiers = ["Ctrl", "Alt"]
-        if not hotkey_key:
-            hotkey_key = "Space"
-        hover_delay_ms = max(100, min(5000, hover_delay_ms))
-        hide_delay_ms = max(0, min(5000, hide_delay_ms))
-        expanded_width = max(260, min(960, expanded_width))
-        expanded_height = max(220, min(960, expanded_height))
+            hotkey_modifiers = ["Alt"]
+
+        hotkey_key = str(data.get("hotkey_key", "Space")) or "Space"
         return cls(
-            edge=edge,
-            offset=offset,
-            expanded_width=expanded_width,
-            expanded_height=expanded_height,
-            hover_delay_ms=hover_delay_ms,
-            hide_delay_ms=hide_delay_ms,
-            pinned_position=pinned_position,
-            launch_mode=launch_mode,
-            auto_start=auto_start,
+            auto_start=bool(data.get("auto_start", False)),
             hotkey_modifiers=hotkey_modifiers,
             hotkey_key=hotkey_key,
             shortcuts=shortcuts,
@@ -82,14 +57,6 @@ class AppConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "edge": self.edge,
-            "offset": self.offset,
-            "expanded_width": self.expanded_width,
-            "expanded_height": self.expanded_height,
-            "hover_delay_ms": self.hover_delay_ms,
-            "hide_delay_ms": self.hide_delay_ms,
-            "pinned_position": self.pinned_position,
-            "launch_mode": self.launch_mode,
             "auto_start": self.auto_start,
             "hotkey_modifiers": self.hotkey_modifiers,
             "hotkey_key": self.hotkey_key,
@@ -108,4 +75,7 @@ def load_config() -> AppConfig:
 
 def save_config(config: AppConfig) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(config.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+    CONFIG_PATH.write_text(
+        json.dumps(config.to_dict(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
