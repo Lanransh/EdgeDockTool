@@ -470,7 +470,7 @@ class LauncherWindow(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMinimumSize(540, 360)
         self.setWindowTitle(APP_NAME)
-        self.setStyleSheet("QWidget#panel { background: rgba(20, 20, 22, 145); border: 1px solid rgba(255,255,255,0.18); border-radius: 18px; }")
+        self.setStyleSheet("QWidget#panel { background: rgba(20, 20, 22, 72); border: 1px solid rgba(255,255,255,0.18); border-radius: 18px; }")
 
         self.panel = QFrame(self)
         self.panel.setObjectName("panel")
@@ -582,12 +582,30 @@ class LauncherWindow(QWidget):
         handle = self.windowHandle()
         if handle is None or os.name != "nt":
             return
-        hwnd = None
+        hwnd = int(handle.winId())
         failures = []
+
+        # Prefer Acrylic because it keeps the desktop visibly translucent.
+        # Applying it together with the system backdrop stacks two dark tints.
         try:
-            hwnd = int(handle.winId())
+            policy = ACCENT_POLICY(4, 2, 0x55141416, 0)  # ACCENT_ENABLE_ACRYLICBLURBEHIND
+            data = WINDOWCOMPOSITIONATTRIBDATA(19, cast(byref(policy), c_void_p), c_size_t(sizeof(policy)))
+            set_composition = user32.SetWindowCompositionAttribute
+            set_composition.argtypes = [wintypes.HWND, c_void_p]
+            set_composition.restype = wintypes.BOOL
+            self._backdrop_applied = bool(set_composition(hwnd, byref(data)))
+            if not self._backdrop_applied:
+                failures.append("SetWindowCompositionAttribute returned false")
+        except (OSError, AttributeError) as error:
+            failures.append(f"Acrylic backdrop failed: {error}")
+
+        if self._backdrop_applied:
+            return
+
+        # Fall back to the Windows 11 system material when Acrylic is unavailable.
+        try:
             dwm = WinDLL("dwmapi", use_last_error=True)
-            backdrop = c_int(3)  # DWMSBT_TRANSIENTWINDOW (acrylic-like)
+            backdrop = c_int(3)  # DWMSBT_TRANSIENTWINDOW
             corner = c_int(2)  # DWMWCP_ROUND
             backdrop_result = dwm.DwmSetWindowAttribute(hwnd, 38, byref(backdrop), 4)
             dwm.DwmSetWindowAttribute(hwnd, 33, byref(corner), 4)
@@ -596,23 +614,6 @@ class LauncherWindow(QWidget):
                 failures.append(f"DwmSetWindowAttribute returned {backdrop_result}")
         except (OSError, AttributeError) as error:
             failures.append(f"DWM backdrop failed: {error}")
-
-        # Also try the legacy acrylic composition API. It is a useful fallback
-        # on older Windows builds and gives a stronger blur on some Win11 themes.
-        if user32 is None or hwnd is None:
-            return
-        try:
-            policy = ACCENT_POLICY(4, 2, 0xCC141416, 0)  # ACCENT_ENABLE_ACRYLICBLURBEHIND
-            data = WINDOWCOMPOSITIONATTRIBDATA(19, cast(byref(policy), c_void_p), c_size_t(sizeof(policy)))
-            set_composition = user32.SetWindowCompositionAttribute
-            set_composition.argtypes = [wintypes.HWND, c_void_p]
-            set_composition.restype = wintypes.BOOL
-            acrylic_applied = bool(set_composition(hwnd, byref(data)))
-            self._backdrop_applied = acrylic_applied or self._backdrop_applied
-            if not acrylic_applied:
-                failures.append("SetWindowCompositionAttribute returned false")
-        except (OSError, AttributeError) as error:
-            failures.append(f"Acrylic backdrop failed: {error}")
         if not self._backdrop_applied:
             append_diagnostic("Backdrop unavailable; using translucent fallback. " + "; ".join(failures))
 
