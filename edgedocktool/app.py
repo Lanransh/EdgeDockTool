@@ -540,6 +540,7 @@ class LauncherWindow(QWidget):
         self._backdrop_applied = False
         self._backdrop_attempted = False
         self._popup_animation: QPropertyAnimation | None = None
+        self._layout_signature = None
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMinimumSize(540, 360)
@@ -652,16 +653,23 @@ class LauncherWindow(QWidget):
         for button in self.buttons:
             button.deleteLater()
         self.buttons = [ShortcutButton(item, self.content) for item in self.config.shortcuts]
+        self._layout_signature = None
         self.relayout()
 
     def relayout(self):
+        query = self.search.text().strip().casefold()
+        visible_buttons = [button for button in self.buttons if not query or query in button.item.name.casefold() or query in button.item.path.casefold()]
+        columns = max(1, min(8, (max(1, self.scroll.viewport().width()) + 16) // 132))
+        signature = (query, columns, tuple(id(button) for button in visible_buttons))
+        if signature == self._layout_signature:
+            return
+        self._layout_signature = signature
+
         while self.grid.count():
             item = self.grid.takeAt(0)
             if item.widget() is not None:
                 item.widget().setParent(self.content)
-        query = self.search.text().strip().casefold()
-        self.visible_buttons = [button for button in self.buttons if not query or query in button.item.name.casefold() or query in button.item.path.casefold()]
-        columns = max(1, min(8, (max(1, self.scroll.viewport().width()) + 16) // 132))
+        self.visible_buttons = visible_buttons
         for index, button in enumerate(self.visible_buttons):
             self.grid.addWidget(button, index // columns, index % columns)
             button.show()
@@ -789,6 +797,8 @@ class LauncherWindow(QWidget):
         return super().event(event)
 
     def eventFilter(self, watched, event):
+        if watched is self.scroll.viewport() and event.type() == QEvent.Resize:
+            self.relayout()
         if watched is self.search and event.type() == QEvent.KeyPress:
             if event.key() == Qt.Key_Escape:
                 self.hide_popup()
@@ -817,7 +827,6 @@ class LauncherWindow(QWidget):
     def resizeEvent(self, event):
         self.panel.setGeometry(self.rect().adjusted(RESIZE_BORDER, RESIZE_BORDER, -RESIZE_BORDER, -RESIZE_BORDER))
         self.position_resize_handles()
-        self.relayout()
         super().resizeEvent(event)
 
 
