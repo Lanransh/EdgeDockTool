@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover - only used on Windows
 
 from PySide6.QtCore import (
     QAbstractNativeEventFilter,
+    QEasingCurve,
     QEvent,
     QFileInfo,
     QPoint,
@@ -45,7 +46,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFileIconProvider,
     QFrame,
-    QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
@@ -81,6 +81,8 @@ MODIFIER_FLAGS = {"Ctrl": MOD_CONTROL, "Alt": MOD_ALT, "Shift": MOD_SHIFT}
 MODIFIER_VKEYS = {"Ctrl": 0x11, "Alt": 0x12, "Shift": 0x10}
 VIRTUAL_KEYS = {"Space": 0x20, **{f"F{i}": 0x6F + i for i in range(1, 13)}}
 VIRTUAL_KEYS.update({chr(code): code for code in range(ord("A"), ord("Z") + 1)})
+
+RESIZE_BORDER = 8
 
 if os.name == "nt":
     user32 = WinDLL("user32", use_last_error=True)
@@ -255,12 +257,13 @@ class SettingsList(QListWidget):
         self.setDragDropMode(QAbstractItemView.DragDrop)
         self.setDefaultDropAction(Qt.MoveAction)
         self.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.setAlternatingRowColors(True)
+        self.setSpacing(5)
         self.setStyleSheet(
             """
-            QListWidget { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 10px; padding: 6px; }
-            QListWidget::item { padding: 8px; border-radius: 6px; }
-            QListWidget::item:selected { background: #1e293b; color: white; }
+            QListWidget { background: white; border: 1px solid #dbe3ee; border-radius: 12px; padding: 7px; outline: none; }
+            QListWidget::item { border: 1px solid transparent; border-radius: 9px; }
+            QListWidget::item:hover { background: #f8fafc; border-color: #e2e8f0; }
+            QListWidget::item:selected { background: #e8f0ff; border-color: #bfd2ff; }
             """
         )
         self.model().rowsMoved.connect(lambda *_: self.items_changed.emit())
@@ -294,13 +297,15 @@ class SettingsList(QListWidget):
         event.acceptProposedAction()
 
     def insert_shortcut(self, item: ShortcutItem, row: int | None = None):
-        list_item = QListWidgetItem(f"{item.name}  [{item.kind}]")
+        list_item = QListWidgetItem()
         list_item.setToolTip(item.path)
         list_item.setData(Qt.UserRole, item)
+        list_item.setSizeHint(QSize(0, 62))
         if row is None:
             self.addItem(list_item)
         else:
             self.insertItem(row, list_item)
+        self.setItemWidget(list_item, SettingsShortcutRow(item, self))
 
     def shortcuts(self) -> list[ShortcutItem]:
         return [
@@ -308,6 +313,39 @@ class SettingsList(QListWidget):
             for index in range(self.count())
             if isinstance((item := self.item(index)).data(Qt.UserRole), ShortcutItem)
         ]
+
+
+class SettingsShortcutRow(QWidget):
+    def __init__(self, item: ShortcutItem, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+        icon = QLabel(self)
+        icon.setPixmap(icon_for_item(item).pixmap(36, 36))
+        icon.setFixedSize(42, 42)
+        icon.setAlignment(Qt.AlignCenter)
+
+        name = QLabel(item.name, self)
+        name.setStyleSheet("color: #172033; font-size: 14px; font-weight: 600;")
+        path = QLabel(item.path, self)
+        path.setStyleSheet("color: #778399; font-size: 11px;")
+        path.setToolTip(item.path)
+
+        text = QVBoxLayout()
+        text.setContentsMargins(0, 0, 0, 0)
+        text.setSpacing(2)
+        text.addWidget(name)
+        text.addWidget(path)
+
+        kind = QLabel("文件夹" if item.kind == "folder" else "软件 / 文件", self)
+        kind.setStyleSheet("color: #52647d; background: #edf2f8; border-radius: 10px; padding: 4px 9px;")
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 7, 10, 7)
+        layout.setSpacing(10)
+        layout.addWidget(icon)
+        layout.addLayout(text, 1)
+        layout.addWidget(kind)
 
 
 class SettingsDialog(QDialog):
@@ -323,18 +361,26 @@ class SettingsDialog(QDialog):
         )
         self.setStyleSheet(
             """
-            QDialog { background: #f1f5f9; }
-            QLabel#title { font-size: 25px; font-weight: 700; color: #0f172a; }
-            QLabel#subtitle { color: #475569; }
-            QPushButton { background: #0f172a; color: white; border: none; border-radius: 7px; padding: 9px 14px; }
-            QPushButton:hover { background: #334155; }
-            QLineEdit { background: white; border: 1px solid #cbd5e1; border-radius: 7px; padding: 8px; }
+            QDialog { background: #f5f7fb; }
+            QLabel#title { font-size: 24px; font-weight: 700; color: #172033; }
+            QLabel#subtitle { color: #66758d; font-size: 12px; }
+            QLabel#sectionTitle { color: #27364d; font-size: 14px; font-weight: 600; }
+            QLabel#sectionHint { color: #7a879a; font-size: 11px; }
+            QPushButton { background: white; color: #334155; border: 1px solid #d7e0eb; border-radius: 8px; padding: 9px 14px; }
+            QPushButton:hover { background: #f8fafc; border-color: #aebcd0; }
+            QPushButton#primary { background: #2563eb; color: white; border-color: #2563eb; font-weight: 600; }
+            QPushButton#primary:hover { background: #1d4ed8; }
+            QPushButton#danger { color: #b42318; }
+            QPushButton#danger:hover { background: #fff1f0; border-color: #f0b8b3; }
+            QLineEdit { background: white; border: 1px solid #d7e0eb; border-radius: 8px; padding: 8px 10px; }
+            QLineEdit:focus { border-color: #7aa2f7; }
+            QCheckBox { color: #41516a; spacing: 7px; }
             """
         )
 
-        title = QLabel("快捷入口设置", self)
+        title = QLabel("管理快捷入口", self)
         title.setObjectName("title")
-        subtitle = QLabel("按 Alt + Space 呼出中央启动器，可拖拽文件、文件夹或程序到列表。", self)
+        subtitle = QLabel("把常用软件、文件和文件夹放到启动面板中。", self)
         subtitle.setObjectName("subtitle")
 
         self.hotkey_input = HotkeyInput(self.config.hotkey_modifiers, self.config.hotkey_key, self)
@@ -352,10 +398,17 @@ class SettingsDialog(QDialog):
         add_file.clicked.connect(self.add_files)
         add_folder = QPushButton("添加文件夹")
         add_folder.clicked.connect(self.add_folder)
-        remove = QPushButton("删除选中")
+        remove = QPushButton("移除选中")
+        remove.setObjectName("danger")
         remove.clicked.connect(self.remove_selected)
         save = QPushButton("保存并关闭")
+        save.setObjectName("primary")
         save.clicked.connect(self.accept)
+
+        section_title = QLabel("已添加的项目", self)
+        section_title.setObjectName("sectionTitle")
+        section_hint = QLabel("可直接拖入项目；拖动列表行可以调整显示顺序", self)
+        section_hint.setObjectName("sectionHint")
 
         hotkey_row = QHBoxLayout()
         hotkey_row.addWidget(QLabel("全局快捷键"))
@@ -376,6 +429,9 @@ class SettingsDialog(QDialog):
         layout.addWidget(title)
         layout.addWidget(subtitle)
         layout.addLayout(hotkey_row)
+        layout.addSpacing(4)
+        layout.addWidget(section_title)
+        layout.addWidget(section_hint)
         layout.addWidget(self.list)
         layout.addLayout(buttons)
 
@@ -420,9 +476,9 @@ class ShortcutButton(QToolButton):
         self.setToolTip(item.path)
         self.setStyleSheet(
             """
-            QToolButton { color: #e5e7eb; background: transparent; border: 1px solid transparent; border-radius: 10px; padding: 8px 5px; font-size: 13px; }
-            QToolButton:hover, QToolButton:focus { background: rgba(255,255,255,0.10); border: 1px solid rgba(147,197,253,0.9); }
-            QToolButton:pressed { background: rgba(96,165,250,0.24); }
+            QToolButton { color: #edf2f7; background: rgba(255,255,255,0.045); border: 1px solid rgba(255,255,255,0.07); border-radius: 13px; padding: 10px 6px; font-size: 13px; }
+            QToolButton:hover, QToolButton:focus { background: rgba(255,255,255,0.12); border-color: rgba(147,197,253,0.72); }
+            QToolButton:pressed { background: rgba(96,165,250,0.22); }
             """
         )
         self.clicked.connect(self._animate_click)
@@ -457,7 +513,24 @@ class ShortcutButton(QToolButton):
         super().keyPressEvent(event)
 
 
+class ResizeHandle(QWidget):
+    def __init__(self, edges, cursor, parent: QWidget):
+        super().__init__(parent)
+        self.edges = edges
+        self.setCursor(cursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            handle = self.window().windowHandle()
+            if handle is not None and handle.startSystemResize(self.edges):
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+
 class LauncherWindow(QWidget):
+    settings_requested = Signal()
+
     def __init__(self, config: AppConfig):
         super().__init__()
         self.config = config
@@ -466,30 +539,39 @@ class LauncherWindow(QWidget):
         self.animating = False
         self._backdrop_applied = False
         self._backdrop_attempted = False
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.Popup | Qt.WindowStaysOnTopHint)
+        self._popup_animation: QPropertyAnimation | None = None
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMinimumSize(540, 360)
         self.setWindowTitle(APP_NAME)
-        self.setStyleSheet("QWidget#panel { background: rgba(20, 20, 22, 72); border: 1px solid rgba(255,255,255,0.18); border-radius: 18px; }")
+        self.setStyleSheet("QWidget#panel { background: rgba(20, 20, 24, 96); border: 1px solid rgba(255,255,255,0.16); border-radius: 16px; }")
 
         self.panel = QFrame(self)
         self.panel.setObjectName("panel")
-        shadow = QGraphicsDropShadowEffect(self.panel)
-        shadow.setBlurRadius(42)
-        shadow.setOffset(0, 12)
-        shadow.setColor(QColor(0, 0, 0, 145))
-        self.panel.setGraphicsEffect(shadow)
+
+        self.title = QLabel("快捷启动", self.panel)
+        self.title.setStyleSheet("color: #f8fafc; font-size: 18px; font-weight: 650;")
 
         self.search = QLineEdit(self.panel)
-        self.search.setPlaceholderText("Search applications...")
+        self.search.setPlaceholderText("搜索软件、文件或文件夹")
         self.search.setClearButtonEnabled(True)
-        self.search.setFixedWidth(430)
+        self.search.setMinimumWidth(240)
+        self.search.setMaximumWidth(470)
+        self.search.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.search.setAlignment(Qt.AlignLeft)
         self.search.setStyleSheet(
-            "QLineEdit { background: rgba(5,5,6,0.80); color: #f8fafc; border: 1px solid rgba(148,163,184,0.42); border-radius: 22px; padding: 11px 16px; font-size: 14px; } QLineEdit:focus { border: 1px solid #93c5fd; }"
+            "QLineEdit { background: rgba(7,9,13,0.66); color: #f8fafc; border: 1px solid rgba(148,163,184,0.34); border-radius: 10px; padding: 10px 13px; font-size: 13px; } QLineEdit:focus { border-color: #7aa2f7; }"
         )
         self.search.installEventFilter(self)
         self.search.textChanged.connect(self.relayout)
+
+        self.manage_button = QPushButton("⚙  管理软件", self.panel)
+        self.manage_button.setCursor(Qt.PointingHandCursor)
+        self.manage_button.setToolTip("添加、移除或排序快捷入口")
+        self.manage_button.setStyleSheet(
+            "QPushButton { color: #e8eef8; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.13); border-radius: 10px; padding: 10px 14px; font-size: 12px; font-weight: 600; } QPushButton:hover { background: rgba(255,255,255,0.15); border-color: rgba(147,197,253,0.62); } QPushButton:pressed { background: rgba(96,165,250,0.20); }"
+        )
+        self.manage_button.clicked.connect(self.open_software_manager)
 
         self.status = QLabel("", self.panel)
         self.status.setStyleSheet("color: rgba(226,232,240,0.62); font-size: 12px;")
@@ -515,19 +597,33 @@ class LauncherWindow(QWidget):
         self.empty.setWordWrap(True)
 
         layout = QVBoxLayout(self.panel)
-        layout.setContentsMargins(28, 22, 28, 24)
-        layout.setSpacing(12)
+        layout.setContentsMargins(24, 20, 24, 22)
+        layout.setSpacing(13)
         header = QHBoxLayout()
+        header.setSpacing(14)
+        header.addWidget(self.title)
         header.addStretch(1)
-        header.addWidget(self.search)
-        header.addStretch(1)
+        header.addWidget(self.search, 1)
+        header.addWidget(self.manage_button)
         layout.addLayout(header)
         layout.addWidget(self.status)
         layout.addWidget(self.scroll, 1)
 
+        self.resize_handles = {
+            "top": ResizeHandle(Qt.TopEdge, Qt.SizeVerCursor, self),
+            "bottom": ResizeHandle(Qt.BottomEdge, Qt.SizeVerCursor, self),
+            "left": ResizeHandle(Qt.LeftEdge, Qt.SizeHorCursor, self),
+            "right": ResizeHandle(Qt.RightEdge, Qt.SizeHorCursor, self),
+            "top_left": ResizeHandle(Qt.TopEdge | Qt.LeftEdge, Qt.SizeFDiagCursor, self),
+            "top_right": ResizeHandle(Qt.TopEdge | Qt.RightEdge, Qt.SizeBDiagCursor, self),
+            "bottom_left": ResizeHandle(Qt.BottomEdge | Qt.LeftEdge, Qt.SizeBDiagCursor, self),
+            "bottom_right": ResizeHandle(Qt.BottomEdge | Qt.RightEdge, Qt.SizeFDiagCursor, self),
+        }
+
         self.refresh_shortcuts()
         self.resize_to_screen()
-        self.panel.setGeometry(self.rect())
+        self.panel.setGeometry(self.rect().adjusted(RESIZE_BORDER, RESIZE_BORDER, -RESIZE_BORDER, -RESIZE_BORDER))
+        self.position_resize_handles()
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
@@ -537,6 +633,13 @@ class LauncherWindow(QWidget):
         geo = screen.availableGeometry()
         width = min(max(760, int(geo.width() * 0.94)), max(540, geo.width() - 36))
         height = min(max(470, int(geo.height() * 0.88)), max(360, geo.height() - 36))
+        self.setGeometry(QRect(geo.left() + (geo.width() - width) // 2, geo.top() + (geo.height() - height) // 2, width, height))
+
+    def center_on_current_screen(self):
+        screen = QApplication.screenAt(self.cursor_pos()) or QApplication.primaryScreen()
+        geo = screen.availableGeometry()
+        width = min(self.width(), max(self.minimumWidth(), geo.width() - 36))
+        height = min(self.height(), max(self.minimumHeight(), geo.height() - 36))
         self.setGeometry(QRect(geo.left() + (geo.width() - width) // 2, geo.top() + (geo.height() - height) // 2, width, height))
 
     @staticmethod
@@ -558,14 +661,14 @@ class LauncherWindow(QWidget):
                 item.widget().setParent(self.content)
         query = self.search.text().strip().casefold()
         self.visible_buttons = [button for button in self.buttons if not query or query in button.item.name.casefold() or query in button.item.path.casefold()]
-        columns = max(1, min(8, (max(1, self.scroll.viewport().width()) + 16) // 128))
+        columns = max(1, min(8, (max(1, self.scroll.viewport().width()) + 16) // 132))
         for index, button in enumerate(self.visible_buttons):
             self.grid.addWidget(button, index // columns, index % columns)
             button.show()
         for button in self.buttons:
             if button not in self.visible_buttons:
                 button.hide()
-        self.empty.setText("没有匹配的应用" if self.buttons and query else "还没有快捷入口\n打开设置后拖入文件、文件夹或程序")
+        self.empty.setText("没有匹配的项目" if self.buttons and query else "这里还没有快捷入口\n点击右上角“管理软件”开始添加")
         self.empty.setVisible(not self.visible_buttons)
         if self.empty.isVisible():
             self.grid.addWidget(self.empty, 0, 0, 1, max(1, columns))
@@ -624,52 +727,66 @@ class LauncherWindow(QWidget):
             self.show_popup()
 
     def show_popup(self):
-        self.resize_to_screen()
-        target = QRect(self.geometry())
-        start = QRect(target)
-        start.setWidth(max(300, int(target.width() * 0.94)))
-        start.setHeight(max(240, int(target.height() * 0.94)))
-        start.moveCenter(target.center())
-        self.setGeometry(start)
-        self.setWindowOpacity(0.0)
+        self.center_on_current_screen()
+        self.setWindowOpacity(0.90)
         self.show()
         self.raise_()
         self.activateWindow()
         self.search.clear()
         self.search.setFocus(Qt.PopupFocusReason)
         self.relayout()
-        self._animate_popup(start, target, opening=True)
+        self._animate_popup(opening=True)
 
     def hide_popup(self):
         if not self.isVisible() or self.animating:
             return
-        start = QRect(self.geometry())
-        end = QRect(start)
-        end.setWidth(max(300, int(start.width() * 0.94)))
-        end.setHeight(max(240, int(start.height() * 0.94)))
-        end.moveCenter(start.center())
-        self._animate_popup(start, end, opening=False)
+        self._animate_popup(opening=False)
 
-    def _animate_popup(self, start: QRect, end: QRect, opening: bool):
+    def _animate_popup(self, opening: bool):
         self.animating = True
-        geometry = QPropertyAnimation(self, b"geometry", self)
-        geometry.setDuration(180)
-        geometry.setStartValue(start)
-        geometry.setEndValue(end)
         opacity = QPropertyAnimation(self, b"windowOpacity", self)
-        opacity.setDuration(180)
-        opacity.setStartValue(0.0 if opening else 1.0)
-        opacity.setEndValue(1.0 if opening else 0.0)
-        self._popup_animations = (geometry, opacity)
-        geometry.finished.connect(lambda: self._animation_finished(opening))
-        geometry.start(QPropertyAnimation.DeleteWhenStopped)
+        opacity.setDuration(95 if opening else 70)
+        opacity.setStartValue(0.90 if opening else 1.0)
+        opacity.setEndValue(1.0 if opening else 0.94)
+        opacity.setEasingCurve(QEasingCurve.OutCubic if opening else QEasingCurve.InCubic)
+        self._popup_animation = opacity
+        opacity.finished.connect(lambda: self._animation_finished(opening))
         opacity.start(QPropertyAnimation.DeleteWhenStopped)
 
     def _animation_finished(self, opening: bool):
         self.animating = False
+        self._popup_animation = None
         if not opening:
             self.hide()
             self.setWindowOpacity(1.0)
+
+    def open_software_manager(self):
+        if self._popup_animation is not None:
+            self._popup_animation.stop()
+            self._popup_animation = None
+        self.animating = False
+        self.hide()
+        self.setWindowOpacity(1.0)
+        self.settings_requested.emit()
+
+    def position_resize_handles(self):
+        border = RESIZE_BORDER
+        corner = RESIZE_BORDER * 2
+        width = self.width()
+        height = self.height()
+        self.resize_handles["top"].setGeometry(corner, 0, max(0, width - corner * 2), border)
+        self.resize_handles["bottom"].setGeometry(corner, height - border, max(0, width - corner * 2), border)
+        self.resize_handles["left"].setGeometry(0, corner, border, max(0, height - corner * 2))
+        self.resize_handles["right"].setGeometry(width - border, corner, border, max(0, height - corner * 2))
+        self.resize_handles["top_left"].setGeometry(0, 0, corner, corner)
+        self.resize_handles["top_right"].setGeometry(width - corner, 0, corner, corner)
+        self.resize_handles["bottom_left"].setGeometry(0, height - corner, corner, corner)
+        self.resize_handles["bottom_right"].setGeometry(width - corner, height - corner, corner, corner)
+
+    def event(self, event):
+        if event.type() == QEvent.WindowDeactivate and self.isVisible() and not self.animating:
+            QTimer.singleShot(0, self.hide_popup)
+        return super().event(event)
 
     def eventFilter(self, watched, event):
         if watched is self.search and event.type() == QEvent.KeyPress:
@@ -698,7 +815,8 @@ class LauncherWindow(QWidget):
         super().keyPressEvent(event)
 
     def resizeEvent(self, event):
-        self.panel.setGeometry(self.rect())
+        self.panel.setGeometry(self.rect().adjusted(RESIZE_BORDER, RESIZE_BORDER, -RESIZE_BORDER, -RESIZE_BORDER))
+        self.position_resize_handles()
         self.relayout()
         super().resizeEvent(event)
 
@@ -724,6 +842,7 @@ class AppTray(QApplication):
         self.config = load_config()
         self.icon = create_app_icon()
         self.window = LauncherWindow(self.config)
+        self.window.settings_requested.connect(self.open_settings)
         self.settings_dialog: SettingsDialog | None = None
         self.hotkey_filter = HotkeyFilter(self.toggle_window_from_hotkey)
         self.installNativeEventFilter(self.hotkey_filter)
