@@ -94,6 +94,8 @@ PANEL_SIZES = {
     "medium": QSize(840, 540),
     "large": QSize(1080, 700),
 }
+_ICON_PROVIDER: QFileIconProvider | None = None
+_ICON_CACHE: dict[tuple[str, str], QIcon] = {}
 
 if os.name == "nt":
     user32 = WinDLL("user32", use_last_error=True)
@@ -222,10 +224,24 @@ def fallback_icon(kind: str, size: int = 72) -> QIcon:
 
 
 def icon_for_item(item: ShortcutItem) -> QIcon:
+    global _ICON_PROVIDER
+
+    cache_key = (item.kind, item.path)
+    cached = _ICON_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     if item.kind == "stack":
-        return fallback_icon("stack")
-    icon = QFileIconProvider().icon(QFileInfo(item.path))
-    return icon if not icon.isNull() else fallback_icon(item.kind)
+        icon = fallback_icon("stack")
+    else:
+        if _ICON_PROVIDER is None:
+            _ICON_PROVIDER = QFileIconProvider()
+        icon = _ICON_PROVIDER.icon(QFileInfo(item.path))
+        if icon.isNull():
+            icon = fallback_icon(item.kind)
+    if len(_ICON_CACHE) >= 256:
+        _ICON_CACHE.clear()
+    _ICON_CACHE[cache_key] = icon
+    return icon
 
 
 class SettingsDialog(QDialog):
@@ -330,8 +346,8 @@ class ShortcutButton(QToolButton):
         self.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
         self.setIcon(icon_for_item(item))
         self.setIconSize(QSize(self.base_icon_size, self.base_icon_size))
-        self.setMinimumSize(112, 112)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setFixedSize(116, 112)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.setCursor(Qt.PointingHandCursor)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setAcceptDrops(drag_mode)
@@ -546,7 +562,6 @@ class LauncherWindow(QWidget):
         self.storage_timer = QTimer(self)
         self.storage_timer.setInterval(900)
         self.storage_timer.timeout.connect(self.refresh_if_storage_changed)
-        self.storage_timer.start()
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
@@ -594,6 +609,9 @@ class LauncherWindow(QWidget):
         self.refresh_shortcuts()
 
     def refresh_if_storage_changed(self):
+        if not self.current_directory().exists():
+            self.refresh_shortcuts()
+            return
         signature = storage_signature(self.current_directory())
         if signature != self._store_signature:
             self.refresh_shortcuts()
@@ -634,8 +652,14 @@ class LauncherWindow(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        self.refresh_if_storage_changed()
+        self.storage_timer.start()
         if not self._backdrop_attempted:
             self._apply_backdrop()
+
+    def hideEvent(self, event):
+        self.storage_timer.stop()
+        super().hideEvent(event)
 
     def _apply_backdrop(self):
         self._backdrop_attempted = True
@@ -727,6 +751,9 @@ class LauncherWindow(QWidget):
         self.animating = False
         self.hide()
         self.setWindowOpacity(1.0)
+        if self.current_stack_path is not None:
+            self.current_stack_path = None
+            self.refresh_shortcuts()
         self.settings_requested.emit()
 
     def open_stack(self, item: ShortcutItem):
@@ -736,7 +763,9 @@ class LauncherWindow(QWidget):
 
     def close_stack(self):
         if self.current_stack_path is not None:
-            self.transition_to_stack(None)
+            root = ensure_shortcuts_dir()
+            parent = self.current_stack_path.parent
+            self.transition_to_stack(None if parent == root else parent)
 
     def transition_to_stack(self, stack_path: Path | None):
         if self._content_animation is not None:
