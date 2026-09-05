@@ -19,9 +19,9 @@ from PySide6.QtCore import (
     QEasingCurve,
     QEvent,
     QFileInfo,
+    QMimeData,
     QPoint,
     QPropertyAnimation,
-    QRect,
     QSize,
     Qt,
     QTimer,
@@ -31,6 +31,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QAction,
     QColor,
+    QDrag,
     QDragEnterEvent,
     QDropEvent,
     QIcon,
@@ -40,10 +41,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
-    QAbstractItemView,
     QCheckBox,
     QDialog,
-    QFileDialog,
     QFileIconProvider,
     QFrame,
     QGraphicsOpacityEffect,
@@ -51,10 +50,9 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMenu,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSizePolicy,
     QSystemTrayIcon,
@@ -65,10 +63,18 @@ from PySide6.QtWidgets import (
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 from .config import AppConfig, ShortcutItem, load_config, save_config
-from .utils import display_name, item_kind, open_path
+from .shortcut_store import (
+    add_shortcut,
+    create_stack,
+    ensure_shortcuts_dir,
+    migrate_legacy_shortcuts,
+    scan_shortcuts,
+    storage_signature,
+)
+from .utils import open_path
 
 APP_NAME = "EdgeDockTool"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 RESTART_EXIT_CODE = 42
 INSTANCE_SERVER_NAME = "EdgeDockTool.SingleInstance.v1"
 HOTKEY_ID = 1
@@ -82,7 +88,12 @@ MODIFIER_VKEYS = {"Ctrl": 0x11, "Alt": 0x12, "Shift": 0x10}
 VIRTUAL_KEYS = {"Space": 0x20, **{f"F{i}": 0x6F + i for i in range(1, 13)}}
 VIRTUAL_KEYS.update({chr(code): code for code in range(ord("A"), ord("Z") + 1)})
 
-RESIZE_BORDER = 8
+INTERNAL_DRAG_MIME = "application/x-edgedock-entry"
+PANEL_SIZES = {
+    "small": QSize(640, 420),
+    "medium": QSize(840, 540),
+    "large": QSize(1080, 700),
+}
 
 if os.name == "nt":
     user32 = WinDLL("user32", use_last_error=True)
@@ -164,47 +175,6 @@ def format_hotkey(modifiers: list[str], key: str) -> str:
     return "+".join([*modifiers, key])
 
 
-class HotkeyInput(QLineEdit):
-    hotkey_changed = Signal(list, str)
-
-    def __init__(self, modifiers: list[str], key: str, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.modifiers = list(modifiers)
-        self.key_name = key
-        self.setReadOnly(True)
-        self.setPlaceholderText("点击后按下快捷键")
-        self.setText(format_hotkey(self.modifiers, self.key_name))
-
-    def keyPressEvent(self, event: QKeyEvent):
-        qt_modifiers = event.modifiers()
-        modifiers = []
-        if qt_modifiers & Qt.ControlModifier:
-            modifiers.append("Ctrl")
-        if qt_modifiers & Qt.AltModifier:
-            modifiers.append("Alt")
-        if qt_modifiers & Qt.ShiftModifier:
-            modifiers.append("Shift")
-
-        key = event.key()
-        if key == Qt.Key_Space:
-            key_name = "Space"
-        elif Qt.Key_F1 <= key <= Qt.Key_F12:
-            key_name = f"F{key - Qt.Key_F1 + 1}"
-        elif Qt.Key_A <= key <= Qt.Key_Z:
-            key_name = chr(key)
-        else:
-            super().keyPressEvent(event)
-            return
-
-        if not modifiers:
-            modifiers = ["Alt"]
-        self.modifiers = modifiers
-        self.key_name = key_name
-        self.setText(format_hotkey(modifiers, key_name))
-        self.hotkey_changed.emit(list(modifiers), key_name)
-        event.accept()
-
-
 def create_app_icon() -> QIcon:
     pixmap = QPixmap(64, 64)
     pixmap.fill(Qt.transparent)
@@ -228,7 +198,15 @@ def fallback_icon(kind: str, size: int = 72) -> QIcon:
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing)
     painter.setPen(Qt.NoPen)
-    if kind == "folder":
+    if kind == "stack":
+        for offset, color in ((4, "#64748b"), (0, "#dbeafe")):
+            painter.setBrush(QColor(color))
+            painter.drawRoundedRect(int(size * 0.16) + offset, int(size * 0.18) - offset, int(size * 0.66), int(size * 0.62), 10, 10)
+        painter.setBrush(QColor("#60a5fa"))
+        cell = int(size * 0.17)
+        for x, y in ((0.27, 0.31), (0.52, 0.31), (0.27, 0.55), (0.52, 0.55)):
+            painter.drawRoundedRect(int(size * x), int(size * y), cell, cell, 4, 4)
+    elif kind == "folder":
         painter.setBrush(QColor("#f6c453"))
         painter.drawRoundedRect(int(size * 0.10), int(size * 0.28), int(size * 0.80), int(size * 0.48), 9, 9)
         painter.setBrush(QColor("#ffdc7b"))
@@ -244,119 +222,23 @@ def fallback_icon(kind: str, size: int = 72) -> QIcon:
 
 
 def icon_for_item(item: ShortcutItem) -> QIcon:
+    if item.kind == "stack":
+        return fallback_icon("stack")
     icon = QFileIconProvider().icon(QFileInfo(item.path))
     return icon if not icon.isNull() else fallback_icon(item.kind)
-
-
-class SettingsList(QListWidget):
-    items_changed = Signal()
-
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setAcceptDrops(True)
-        self.setDragDropMode(QAbstractItemView.DragDrop)
-        self.setDefaultDropAction(Qt.MoveAction)
-        self.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.setSpacing(5)
-        self.setStyleSheet(
-            """
-            QListWidget { background: white; border: 1px solid #dbe3ee; border-radius: 12px; padding: 7px; outline: none; }
-            QListWidget::item { border: 1px solid transparent; border-radius: 9px; }
-            QListWidget::item:hover { background: #f8fafc; border-color: #e2e8f0; }
-            QListWidget::item:selected { background: #e8f0ff; border-color: #bfd2ff; }
-            """
-        )
-        self.model().rowsMoved.connect(lambda *_: self.items_changed.emit())
-
-    def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            super().dragEnterEvent(event)
-
-    def dragMoveEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            super().dragMoveEvent(event)
-
-    def dropEvent(self, event: QDropEvent):
-        if not event.mimeData().hasUrls():
-            super().dropEvent(event)
-            self.items_changed.emit()
-            return
-        row = self.indexAt(event.position().toPoint()).row()
-        if row < 0:
-            row = self.count()
-        for url in event.mimeData().urls():
-            path = url.toLocalFile()
-            if path:
-                self.insert_shortcut(ShortcutItem(display_name(path), path, item_kind(path)), row)
-                row += 1
-        self.items_changed.emit()
-        event.acceptProposedAction()
-
-    def insert_shortcut(self, item: ShortcutItem, row: int | None = None):
-        list_item = QListWidgetItem()
-        list_item.setToolTip(item.path)
-        list_item.setData(Qt.UserRole, item)
-        list_item.setSizeHint(QSize(0, 62))
-        if row is None:
-            self.addItem(list_item)
-        else:
-            self.insertItem(row, list_item)
-        self.setItemWidget(list_item, SettingsShortcutRow(item, self))
-
-    def shortcuts(self) -> list[ShortcutItem]:
-        return [
-            item.data(Qt.UserRole)
-            for index in range(self.count())
-            if isinstance((item := self.item(index)).data(Qt.UserRole), ShortcutItem)
-        ]
-
-
-class SettingsShortcutRow(QWidget):
-    def __init__(self, item: ShortcutItem, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents)
-
-        icon = QLabel(self)
-        icon.setPixmap(icon_for_item(item).pixmap(36, 36))
-        icon.setFixedSize(42, 42)
-        icon.setAlignment(Qt.AlignCenter)
-
-        name = QLabel(item.name, self)
-        name.setStyleSheet("color: #172033; font-size: 14px; font-weight: 600;")
-        path = QLabel(item.path, self)
-        path.setStyleSheet("color: #778399; font-size: 11px;")
-        path.setToolTip(item.path)
-
-        text = QVBoxLayout()
-        text.setContentsMargins(0, 0, 0, 0)
-        text.setSpacing(2)
-        text.addWidget(name)
-        text.addWidget(path)
-
-        kind = QLabel("文件夹" if item.kind == "folder" else "软件 / 文件", self)
-        kind.setStyleSheet("color: #52647d; background: #edf2f8; border-radius: 10px; padding: 4px 9px;")
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 7, 10, 7)
-        layout.setSpacing(10)
-        layout.addWidget(icon)
-        layout.addLayout(text, 1)
-        layout.addWidget(kind)
 
 
 class SettingsDialog(QDialog):
     def __init__(self, config: AppConfig, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle(f"{APP_NAME} 设置")
-        self.resize(720, 560)
+        self.setFixedSize(540, 390)
         self.config = AppConfig(
             auto_start=config.auto_start,
             hotkey_modifiers=list(config.hotkey_modifiers),
             hotkey_key=config.hotkey_key,
+            drag_mode=config.drag_mode,
+            panel_size=config.panel_size,
             shortcuts=list(config.shortcuts),
         )
         self.setStyleSheet(
@@ -364,115 +246,95 @@ class SettingsDialog(QDialog):
             QDialog { background: #f5f7fb; }
             QLabel#title { font-size: 24px; font-weight: 700; color: #172033; }
             QLabel#subtitle { color: #66758d; font-size: 12px; }
+            QFrame#card { background: white; border: 1px solid #dbe3ee; border-radius: 12px; }
             QLabel#sectionTitle { color: #27364d; font-size: 14px; font-weight: 600; }
             QLabel#sectionHint { color: #7a879a; font-size: 11px; }
             QPushButton { background: white; color: #334155; border: 1px solid #d7e0eb; border-radius: 8px; padding: 9px 14px; }
             QPushButton:hover { background: #f8fafc; border-color: #aebcd0; }
             QPushButton#primary { background: #2563eb; color: white; border-color: #2563eb; font-weight: 600; }
             QPushButton#primary:hover { background: #1d4ed8; }
-            QPushButton#danger { color: #b42318; }
-            QPushButton#danger:hover { background: #fff1f0; border-color: #f0b8b3; }
-            QLineEdit { background: white; border: 1px solid #d7e0eb; border-radius: 8px; padding: 8px 10px; }
-            QLineEdit:focus { border-color: #7aa2f7; }
             QCheckBox { color: #41516a; spacing: 7px; }
+            QRadioButton { color: #41516a; spacing: 7px; padding: 5px; }
             """
         )
 
-        title = QLabel("管理快捷入口", self)
+        title = QLabel("启动面板设置", self)
         title.setObjectName("title")
-        subtitle = QLabel("把常用软件、文件和文件夹放到启动面板中。", self)
+        subtitle = QLabel("开启拖动模式后，可直接添加项目或将两个图标合并为堆叠。", self)
         subtitle.setObjectName("subtitle")
 
-        self.hotkey_input = HotkeyInput(self.config.hotkey_modifiers, self.config.hotkey_key, self)
-        self.hotkey_input.hotkey_changed.connect(self.on_hotkey_changed)
-        self.auto_start_checkbox = QCheckBox("开机自启", self)
-        self.auto_start_checkbox.setChecked(self.config.auto_start)
-        self.auto_start_checkbox.stateChanged.connect(self.on_changed)
+        self.drag_mode_checkbox = QCheckBox("可拖动模式", self)
+        self.drag_mode_checkbox.setChecked(self.config.drag_mode)
+        drag_hint = QLabel("允许从资源管理器拖入项目，也允许图标互拖创建堆叠", self)
+        drag_hint.setObjectName("sectionHint")
 
-        self.list = SettingsList(self)
-        for item in self.config.shortcuts:
-            self.list.insert_shortcut(item)
-        self.list.items_changed.connect(self.on_changed)
+        size_title = QLabel("面板大小", self)
+        size_title.setObjectName("sectionTitle")
+        self.size_buttons = {}
+        size_row = QHBoxLayout()
+        for key, label in (("small", "小"), ("medium", "中"), ("large", "大")):
+            button = QRadioButton(label, self)
+            button.setChecked(key == self.config.panel_size)
+            self.size_buttons[key] = button
+            size_row.addWidget(button)
+        size_row.addStretch(1)
 
-        add_file = QPushButton("添加文件")
-        add_file.clicked.connect(self.add_files)
-        add_folder = QPushButton("添加文件夹")
-        add_folder.clicked.connect(self.add_folder)
-        remove = QPushButton("移除选中")
-        remove.setObjectName("danger")
-        remove.clicked.connect(self.remove_selected)
+        open_folder = QPushButton("打开快捷入口文件夹")
+        open_folder.clicked.connect(self.open_shortcuts_folder)
         save = QPushButton("保存并关闭")
         save.setObjectName("primary")
-        save.clicked.connect(self.accept)
-
-        section_title = QLabel("已添加的项目", self)
-        section_title.setObjectName("sectionTitle")
-        section_hint = QLabel("可直接拖入项目；拖动列表行可以调整显示顺序", self)
-        section_hint.setObjectName("sectionHint")
-
-        hotkey_row = QHBoxLayout()
-        hotkey_row.addWidget(QLabel("全局快捷键"))
-        hotkey_row.addWidget(self.hotkey_input)
-        hotkey_row.addWidget(self.auto_start_checkbox)
-        hotkey_row.addStretch(1)
+        save.clicked.connect(self.save_and_close)
 
         buttons = QHBoxLayout()
-        buttons.addWidget(add_file)
-        buttons.addWidget(add_folder)
-        buttons.addWidget(remove)
+        buttons.addWidget(open_folder)
         buttons.addStretch(1)
         buttons.addWidget(save)
+
+        card = QFrame(self)
+        card.setObjectName("card")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(18, 17, 18, 17)
+        card_layout.setSpacing(10)
+        card_layout.addWidget(self.drag_mode_checkbox)
+        card_layout.addWidget(drag_hint)
+        card_layout.addSpacing(8)
+        card_layout.addWidget(size_title)
+        card_layout.addLayout(size_row)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(26, 24, 26, 24)
         layout.setSpacing(13)
         layout.addWidget(title)
         layout.addWidget(subtitle)
-        layout.addLayout(hotkey_row)
-        layout.addSpacing(4)
-        layout.addWidget(section_title)
-        layout.addWidget(section_hint)
-        layout.addWidget(self.list)
+        layout.addWidget(card, 1)
         layout.addLayout(buttons)
 
-    def add_files(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "选择文件")
-        for path in paths:
-            self.list.insert_shortcut(ShortcutItem(display_name(path), path, item_kind(path)))
-        self.on_changed()
+    def open_shortcuts_folder(self):
+        open_path(str(ensure_shortcuts_dir()))
 
-    def add_folder(self):
-        path = QFileDialog.getExistingDirectory(self, "选择文件夹")
-        if path:
-            self.list.insert_shortcut(ShortcutItem(display_name(path), path, item_kind(path)))
-            self.on_changed()
-
-    def remove_selected(self):
-        for item in self.list.selectedItems():
-            self.list.takeItem(self.list.row(item))
-        self.on_changed()
-
-    def on_changed(self):
-        self.config.auto_start = self.auto_start_checkbox.isChecked()
-        self.config.shortcuts = self.list.shortcuts()
-
-    def on_hotkey_changed(self, modifiers: list[str], key: str):
-        self.config.hotkey_modifiers = list(modifiers)
-        self.config.hotkey_key = key
+    def save_and_close(self):
+        self.config.drag_mode = self.drag_mode_checkbox.isChecked()
+        self.config.panel_size = next(key for key, button in self.size_buttons.items() if button.isChecked())
+        self.accept()
 
 
 class ShortcutButton(QToolButton):
-    def __init__(self, item: ShortcutItem, parent: QWidget | None = None):
+    def __init__(self, item: ShortcutItem, drag_mode: bool, parent: QWidget | None = None):
         super().__init__(parent)
         self.item = item
+        self.drag_mode = drag_mode
+        self.base_icon_size = 64
+        self._press_position: QPoint | None = None
+        self._icon_animation: QPropertyAnimation | None = None
         self.setText(item.name)
         self.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
         self.setIcon(icon_for_item(item))
-        self.setIconSize(QSize(64, 64))
+        self.setIconSize(QSize(self.base_icon_size, self.base_icon_size))
         self.setMinimumSize(112, 112)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setCursor(Qt.PointingHandCursor)
         self.setFocusPolicy(Qt.StrongFocus)
+        self.setAcceptDrops(drag_mode)
         self.setToolTip(item.path)
         self.setStyleSheet(
             """
@@ -484,48 +346,100 @@ class ShortcutButton(QToolButton):
         self.clicked.connect(self._animate_click)
 
     def _animate_click(self):
-        effect = self.graphicsEffect()
-        if not isinstance(effect, QGraphicsOpacityEffect):
-            effect = QGraphicsOpacityEffect(self)
-            self.setGraphicsEffect(effect)
-        animation = QPropertyAnimation(effect, b"opacity", self)
-        animation.setDuration(150)
-        animation.setStartValue(1.0)
-        animation.setKeyValueAt(0.45, 0.48)
-        animation.setEndValue(1.0)
-        animation.finished.connect(self._launch_after_animation)
+        if self._icon_animation is not None:
+            self._icon_animation.stop()
+        animation = QPropertyAnimation(self, b"iconSize", self)
+        animation.setDuration(190)
+        animation.setStartValue(self.iconSize())
+        animation.setKeyValueAt(0.28, QSize(56, 56))
+        animation.setKeyValueAt(0.68, QSize(69, 69))
+        animation.setEndValue(QSize(self.base_icon_size, self.base_icon_size))
+        animation.setEasingCurve(QEasingCurve.OutCubic)
+        self._icon_animation = animation
+        animation.finished.connect(lambda: setattr(self, "_icon_animation", None))
         animation.start(QPropertyAnimation.DeleteWhenStopped)
+        QTimer.singleShot(140, self._launch_after_animation)
 
     def _launch_after_animation(self):
-        open_path(self.item.path)
         window = self.window()
+        if self.item.kind == "stack":
+            open_stack = getattr(window, "open_stack", None)
+            if callable(open_stack):
+                open_stack(self.item)
+            return
+        open_path(self.item.path)
         hide_popup = getattr(window, "hide_popup", None)
         if callable(hide_popup):
             hide_popup()
 
-    def keyPressEvent(self, event: QKeyEvent):
-        if event.key() == Qt.Key_Escape:
-            hide_popup = getattr(self.window(), "hide_popup", None)
-            if callable(hide_popup):
-                hide_popup()
-                event.accept()
-                return
-        super().keyPressEvent(event)
+    def _animate_hover(self, size: int):
+        if self._icon_animation is not None:
+            self._icon_animation.stop()
+        animation = QPropertyAnimation(self, b"iconSize", self)
+        animation.setDuration(115)
+        animation.setStartValue(self.iconSize())
+        animation.setEndValue(QSize(size, size))
+        animation.setEasingCurve(QEasingCurve.OutCubic)
+        self._icon_animation = animation
+        animation.finished.connect(lambda: setattr(self, "_icon_animation", None))
+        animation.start(QPropertyAnimation.DeleteWhenStopped)
 
+    def enterEvent(self, event):
+        self._animate_hover(70)
+        super().enterEvent(event)
 
-class ResizeHandle(QWidget):
-    def __init__(self, edges, cursor, parent: QWidget):
-        super().__init__(parent)
-        self.edges = edges
-        self.setCursor(cursor)
+    def leaveEvent(self, event):
+        self._animate_hover(self.base_icon_size)
+        super().leaveEvent(event)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            handle = self.window().windowHandle()
-            if handle is not None and handle.startSystemResize(self.edges):
+            self._press_position = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            self.drag_mode
+            and self.item.kind != "stack"
+            and self._press_position is not None
+            and event.buttons() & Qt.LeftButton
+            and (event.position().toPoint() - self._press_position).manhattanLength() >= QApplication.startDragDistance()
+        ):
+            mime = QMimeData()
+            mime.setData(INTERNAL_DRAG_MIME, self.item.storage_path.encode("utf-8"))
+            drag = QDrag(self)
+            drag.setMimeData(mime)
+            drag.setPixmap(self.icon().pixmap(52, 52))
+            drag.setHotSpot(QPoint(26, 26))
+            self._press_position = None
+            drag.exec(Qt.MoveAction)
+            self.setDown(False)
+            return
+        super().mouseMoveEvent(event)
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if self.drag_mode and event.mimeData().hasFormat(INTERNAL_DRAG_MIME):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dropEvent(self, event: QDropEvent):
+        if self.drag_mode and event.mimeData().hasFormat(INTERNAL_DRAG_MIME):
+            source = bytes(event.mimeData().data(INTERNAL_DRAG_MIME)).decode("utf-8")
+            stack_items = getattr(self.window(), "stack_items", None)
+            if callable(stack_items) and stack_items(source, self.item.storage_path):
+                event.acceptProposedAction()
+                return
+        super().dropEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() == Qt.Key_Escape:
+            handle_escape = getattr(self.window(), "handle_escape", None)
+            if callable(handle_escape):
+                handle_escape()
                 event.accept()
                 return
-        super().mousePressEvent(event)
+        super().keyPressEvent(event)
 
 
 class LauncherWindow(QWidget):
@@ -536,14 +450,15 @@ class LauncherWindow(QWidget):
         self.config = config
         self.visible_buttons: list[ShortcutButton] = []
         self.buttons: list[ShortcutButton] = []
+        self.current_stack_path: Path | None = None
         self.animating = False
         self._backdrop_applied = False
         self._backdrop_attempted = False
         self._popup_animation: QPropertyAnimation | None = None
+        self._content_animation: QPropertyAnimation | None = None
         self._layout_signature = None
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setMinimumSize(540, 360)
         self.setWindowTitle(APP_NAME)
         self.setStyleSheet("QWidget#panel { background: rgba(20, 20, 24, 96); border: 1px solid rgba(255,255,255,0.16); border-radius: 16px; }")
 
@@ -566,9 +481,9 @@ class LauncherWindow(QWidget):
         self.search.installEventFilter(self)
         self.search.textChanged.connect(self.relayout)
 
-        self.manage_button = QPushButton("⚙  管理软件", self.panel)
+        self.manage_button = QPushButton("⚙  设置", self.panel)
         self.manage_button.setCursor(Qt.PointingHandCursor)
-        self.manage_button.setToolTip("添加、移除或排序快捷入口")
+        self.manage_button.setToolTip("拖动模式、面板大小和管理文件夹")
         self.manage_button.setStyleSheet(
             "QPushButton { color: #e8eef8; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.13); border-radius: 10px; padding: 10px 14px; font-size: 12px; font-weight: 600; } QPushButton:hover { background: rgba(255,255,255,0.15); border-color: rgba(147,197,253,0.62); } QPushButton:pressed { background: rgba(96,165,250,0.20); }"
         )
@@ -585,6 +500,9 @@ class LauncherWindow(QWidget):
         self.scroll.setStyleSheet("QScrollArea { background: transparent; }")
         self.content = QWidget()
         self.content.setStyleSheet("background: transparent;")
+        self.content_opacity = QGraphicsOpacityEffect(self.content)
+        self.content_opacity.setOpacity(1.0)
+        self.content.setGraphicsEffect(self.content_opacity)
         self.grid = QGridLayout(self.content)
         self.grid.setContentsMargins(12, 8, 12, 12)
         self.grid.setHorizontalSpacing(16)
@@ -602,6 +520,16 @@ class LauncherWindow(QWidget):
         layout.setSpacing(13)
         header = QHBoxLayout()
         header.setSpacing(14)
+        self.back_button = QToolButton(self.panel)
+        self.back_button.setText("←")
+        self.back_button.setCursor(Qt.PointingHandCursor)
+        self.back_button.setToolTip("返回全部快捷入口")
+        self.back_button.setStyleSheet(
+            "QToolButton { color: #f8fafc; background: rgba(255,255,255,0.08); border: none; border-radius: 9px; padding: 7px 10px; font-size: 18px; } QToolButton:hover { background: rgba(255,255,255,0.16); }"
+        )
+        self.back_button.clicked.connect(self.close_stack)
+        self.back_button.hide()
+        header.addWidget(self.back_button)
         header.addWidget(self.title)
         header.addStretch(1)
         header.addWidget(self.search, 1)
@@ -610,38 +538,30 @@ class LauncherWindow(QWidget):
         layout.addWidget(self.status)
         layout.addWidget(self.scroll, 1)
 
-        self.resize_handles = {
-            "top": ResizeHandle(Qt.TopEdge, Qt.SizeVerCursor, self),
-            "bottom": ResizeHandle(Qt.BottomEdge, Qt.SizeVerCursor, self),
-            "left": ResizeHandle(Qt.LeftEdge, Qt.SizeHorCursor, self),
-            "right": ResizeHandle(Qt.RightEdge, Qt.SizeHorCursor, self),
-            "top_left": ResizeHandle(Qt.TopEdge | Qt.LeftEdge, Qt.SizeFDiagCursor, self),
-            "top_right": ResizeHandle(Qt.TopEdge | Qt.RightEdge, Qt.SizeBDiagCursor, self),
-            "bottom_left": ResizeHandle(Qt.BottomEdge | Qt.LeftEdge, Qt.SizeBDiagCursor, self),
-            "bottom_right": ResizeHandle(Qt.BottomEdge | Qt.RightEdge, Qt.SizeFDiagCursor, self),
-        }
-
+        self.setAcceptDrops(config.drag_mode)
         self.refresh_shortcuts()
-        self.resize_to_screen()
-        self.panel.setGeometry(self.rect().adjusted(RESIZE_BORDER, RESIZE_BORDER, -RESIZE_BORDER, -RESIZE_BORDER))
-        self.position_resize_handles()
+        self.apply_panel_size()
+        self.panel.setGeometry(self.rect())
+        self._store_signature = storage_signature(self.current_directory())
+        self.storage_timer = QTimer(self)
+        self.storage_timer.setInterval(900)
+        self.storage_timer.timeout.connect(self.refresh_if_storage_changed)
+        self.storage_timer.start()
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
 
-    def resize_to_screen(self):
+    def apply_panel_size(self):
         screen = QApplication.screenAt(self.cursor_pos()) or QApplication.primaryScreen()
         geo = screen.availableGeometry()
-        width = min(max(760, int(geo.width() * 0.94)), max(540, geo.width() - 36))
-        height = min(max(470, int(geo.height() * 0.88)), max(360, geo.height() - 36))
-        self.setGeometry(QRect(geo.left() + (geo.width() - width) // 2, geo.top() + (geo.height() - height) // 2, width, height))
+        desired = PANEL_SIZES.get(self.config.panel_size, PANEL_SIZES["medium"])
+        self.setFixedSize(min(desired.width(), geo.width() - 36), min(desired.height(), geo.height() - 36))
 
     def center_on_current_screen(self):
+        self.apply_panel_size()
         screen = QApplication.screenAt(self.cursor_pos()) or QApplication.primaryScreen()
         geo = screen.availableGeometry()
-        width = min(self.width(), max(self.minimumWidth(), geo.width() - 36))
-        height = min(self.height(), max(self.minimumHeight(), geo.height() - 36))
-        self.setGeometry(QRect(geo.left() + (geo.width() - width) // 2, geo.top() + (geo.height() - height) // 2, width, height))
+        self.move(geo.left() + (geo.width() - self.width()) // 2, geo.top() + (geo.height() - self.height()) // 2)
 
     @staticmethod
     def cursor_pos() -> QPoint:
@@ -652,9 +572,31 @@ class LauncherWindow(QWidget):
     def refresh_shortcuts(self):
         for button in self.buttons:
             button.deleteLater()
-        self.buttons = [ShortcutButton(item, self.content) for item in self.config.shortcuts]
+        directory = self.current_directory()
+        if not directory.exists():
+            self.current_stack_path = None
+            directory = self.current_directory()
+        items = scan_shortcuts(directory)
+        self.buttons = [ShortcutButton(item, self.config.drag_mode, self.content) for item in items]
+        self.title.setText(self.current_stack_path.name if self.current_stack_path else "快捷启动")
+        self.back_button.setVisible(self.current_stack_path is not None)
         self._layout_signature = None
         self.relayout()
+        self._store_signature = storage_signature(directory)
+
+    def current_directory(self) -> Path:
+        return self.current_stack_path or ensure_shortcuts_dir()
+
+    def apply_config(self, config: AppConfig):
+        self.config = config
+        self.setAcceptDrops(config.drag_mode)
+        self.apply_panel_size()
+        self.refresh_shortcuts()
+
+    def refresh_if_storage_changed(self):
+        signature = storage_signature(self.current_directory())
+        if signature != self._store_signature:
+            self.refresh_shortcuts()
 
     def relayout(self):
         query = self.search.text().strip().casefold()
@@ -676,12 +618,19 @@ class LauncherWindow(QWidget):
         for button in self.buttons:
             if button not in self.visible_buttons:
                 button.hide()
-        self.empty.setText("没有匹配的项目" if self.buttons and query else "这里还没有快捷入口\n点击右上角“管理软件”开始添加")
+        if self.buttons and query:
+            empty_text = "没有匹配的项目"
+        elif self.config.drag_mode:
+            empty_text = "把软件、文件或文件夹拖到这里"
+        else:
+            empty_text = "这里还没有快捷入口\n在设置中开启可拖动模式，或打开管理文件夹"
+        self.empty.setText(empty_text)
         self.empty.setVisible(not self.visible_buttons)
         if self.empty.isVisible():
             self.grid.addWidget(self.empty, 0, 0, 1, max(1, columns))
         hotkey = format_hotkey(self.config.hotkey_modifiers, self.config.hotkey_key)
-        self.status.setText(f"{len(self.visible_buttons)} 个应用   •   {hotkey} 呼出")
+        mode = "可拖动模式" if self.config.drag_mode else f"{hotkey} 呼出"
+        self.status.setText(f"{len(self.visible_buttons)} 个项目   •   {mode}")
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -767,6 +716,9 @@ class LauncherWindow(QWidget):
         if not opening:
             self.hide()
             self.setWindowOpacity(1.0)
+            if self.current_stack_path is not None:
+                self.current_stack_path = None
+                self.refresh_shortcuts()
 
     def open_software_manager(self):
         if self._popup_animation is not None:
@@ -777,22 +729,82 @@ class LauncherWindow(QWidget):
         self.setWindowOpacity(1.0)
         self.settings_requested.emit()
 
-    def position_resize_handles(self):
-        border = RESIZE_BORDER
-        corner = RESIZE_BORDER * 2
-        width = self.width()
-        height = self.height()
-        self.resize_handles["top"].setGeometry(corner, 0, max(0, width - corner * 2), border)
-        self.resize_handles["bottom"].setGeometry(corner, height - border, max(0, width - corner * 2), border)
-        self.resize_handles["left"].setGeometry(0, corner, border, max(0, height - corner * 2))
-        self.resize_handles["right"].setGeometry(width - border, corner, border, max(0, height - corner * 2))
-        self.resize_handles["top_left"].setGeometry(0, 0, corner, corner)
-        self.resize_handles["top_right"].setGeometry(width - corner, 0, corner, corner)
-        self.resize_handles["bottom_left"].setGeometry(0, height - corner, corner, corner)
-        self.resize_handles["bottom_right"].setGeometry(width - corner, height - corner, corner, corner)
+    def open_stack(self, item: ShortcutItem):
+        stack_path = Path(item.storage_path)
+        if stack_path.is_dir():
+            self.transition_to_stack(stack_path)
+
+    def close_stack(self):
+        if self.current_stack_path is not None:
+            self.transition_to_stack(None)
+
+    def transition_to_stack(self, stack_path: Path | None):
+        if self._content_animation is not None:
+            self._content_animation.stop()
+        animation = QPropertyAnimation(self.content_opacity, b"opacity", self)
+        animation.setDuration(80)
+        animation.setStartValue(self.content_opacity.opacity())
+        animation.setEndValue(0.0)
+        animation.setEasingCurve(QEasingCurve.InCubic)
+        self._content_animation = animation
+        animation.finished.connect(lambda: self._finish_stack_transition(stack_path))
+        animation.start(QPropertyAnimation.DeleteWhenStopped)
+
+    def _finish_stack_transition(self, stack_path: Path | None):
+        self.current_stack_path = stack_path
+        self.search.blockSignals(True)
+        self.search.clear()
+        self.search.blockSignals(False)
+        self.refresh_shortcuts()
+        animation = QPropertyAnimation(self.content_opacity, b"opacity", self)
+        animation.setDuration(150)
+        animation.setStartValue(0.0)
+        animation.setEndValue(1.0)
+        animation.setEasingCurve(QEasingCurve.OutCubic)
+        self._content_animation = animation
+        animation.finished.connect(lambda: setattr(self, "_content_animation", None))
+        animation.start(QPropertyAnimation.DeleteWhenStopped)
+
+    def stack_items(self, source_storage: str, target_storage: str) -> bool:
+        if create_stack(source_storage, target_storage) is None:
+            return False
+        self.refresh_shortcuts()
+        return True
+
+    def handle_escape(self):
+        if self.current_stack_path is not None:
+            self.close_stack()
+        else:
+            self.hide_popup()
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if self.config.drag_mode and event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if self.config.drag_mode and event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QDropEvent):
+        if self.config.drag_mode and event.mimeData().hasUrls():
+            directory = self.current_directory()
+            added = False
+            for url in event.mimeData().urls():
+                path = url.toLocalFile()
+                if path and add_shortcut(path, directory) is not None:
+                    added = True
+            if added:
+                self.refresh_shortcuts()
+                event.acceptProposedAction()
+                return
+        super().dropEvent(event)
 
     def event(self, event):
-        if event.type() == QEvent.WindowDeactivate and self.isVisible() and not self.animating:
+        if event.type() == QEvent.WindowDeactivate and self.isVisible() and not self.animating and not self.config.drag_mode:
             QTimer.singleShot(0, self.hide_popup)
         return super().event(event)
 
@@ -801,11 +813,10 @@ class LauncherWindow(QWidget):
             self.relayout()
         if watched is self.search and event.type() == QEvent.KeyPress:
             if event.key() == Qt.Key_Escape:
-                self.hide_popup()
+                self.handle_escape()
                 return True
             if event.key() in (Qt.Key_Return, Qt.Key_Enter) and self.visible_buttons:
-                open_path(self.visible_buttons[0].item.path)
-                self.hide_popup()
+                self.visible_buttons[0].click()
                 return True
             if event.key() == Qt.Key_Down and self.visible_buttons:
                 self.visible_buttons[0].setFocus()
@@ -819,14 +830,13 @@ class LauncherWindow(QWidget):
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key_Escape:
-            self.hide_popup()
+            self.handle_escape()
             event.accept()
             return
         super().keyPressEvent(event)
 
     def resizeEvent(self, event):
-        self.panel.setGeometry(self.rect().adjusted(RESIZE_BORDER, RESIZE_BORDER, -RESIZE_BORDER, -RESIZE_BORDER))
-        self.position_resize_handles()
+        self.panel.setGeometry(self.rect())
         super().resizeEvent(event)
 
 
@@ -849,6 +859,10 @@ class AppTray(QApplication):
         self.setApplicationVersion(APP_VERSION)
         self.setQuitOnLastWindowClosed(False)
         self.config = load_config()
+        ensure_shortcuts_dir()
+        if migrate_legacy_shortcuts(self.config.shortcuts):
+            self.config.shortcuts = []
+            save_config(self.config)
         self.icon = create_app_icon()
         self.window = LauncherWindow(self.config)
         self.window.settings_requested.connect(self.open_settings)
@@ -871,7 +885,7 @@ class AppTray(QApplication):
         self.tray.show()
         self.sync_hotkey_registration()
         self.apply_auto_start_setting()
-        if not self.config.shortcuts:
+        if not scan_shortcuts():
             QTimer.singleShot(250, self.open_settings)
 
     def _notify_existing_instance(self):
@@ -937,8 +951,7 @@ class AppTray(QApplication):
             if self.settings_dialog.exec():
                 self.config = self.settings_dialog.config
                 save_config(self.config)
-                self.window.config = self.config
-                self.window.refresh_shortcuts()
+                self.window.apply_config(self.config)
                 self.tray.setToolTip(self._tray_tooltip())
                 self.tray.setContextMenu(self.build_menu())
                 self.apply_auto_start_setting()

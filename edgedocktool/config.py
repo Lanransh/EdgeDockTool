@@ -21,6 +21,7 @@ class ShortcutItem:
     name: str
     path: str
     kind: str
+    storage_path: str = ""
 
 
 @dataclass
@@ -28,6 +29,8 @@ class AppConfig:
     auto_start: bool = False
     hotkey_modifiers: list[str] = field(default_factory=lambda: ["Alt"])
     hotkey_key: str = "Space"
+    drag_mode: bool = False
+    panel_size: str = "medium"
     shortcuts: list[ShortcutItem] = field(default_factory=list)
 
     @classmethod
@@ -54,10 +57,15 @@ class AppConfig:
             hotkey_key = str(data.get("hotkey_key", "Space")) or "Space"
         if not hotkey_modifiers:
             hotkey_modifiers = ["Alt"]
+        panel_size = str(data.get("panel_size", "medium"))
+        if panel_size not in {"small", "medium", "large"}:
+            panel_size = "medium"
         return cls(
             auto_start=bool(data.get("auto_start", False)),
             hotkey_modifiers=hotkey_modifiers,
             hotkey_key=hotkey_key,
+            drag_mode=bool(data.get("drag_mode", False)),
+            panel_size=panel_size,
             shortcuts=shortcuts,
         )
 
@@ -66,6 +74,8 @@ class AppConfig:
             "auto_start": self.auto_start,
             "hotkey_modifiers": self.hotkey_modifiers,
             "hotkey_key": self.hotkey_key,
+            "drag_mode": self.drag_mode,
+            "panel_size": self.panel_size,
             "shortcuts": [asdict(item) for item in self.shortcuts],
         }
 
